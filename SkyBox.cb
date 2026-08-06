@@ -1,0 +1,94 @@
+import Mesh.cb
+import Material.cb
+import MaterialManager.cb
+import Texture.cb          // Texture（含 LoadTextureCube，对齐 C++ Texture）
+import view3d.cb          // View3D / DRAW_TYPE_NORMAL / DRAW_TYPE_SKYBOX
+import ShaderManager.cb   // getShaderManager() / SHADER_TYPE_SKYBOX
+import Render3DCatch.cb
+import Light.cb           // Sprite3D 基类
+
+// SkyBox：天空盒（对应 d3dcdemo/SkyBox.h + SkyBox.cpp）
+//   渲染一个以相机为中心、只取旋转不取平移的单位立方体，
+//   用立方体贴图（cubemap）作为背景，并写入远平面深度，
+//   使后续场景物体正确绘制在其前方。
+//   与 C++ 一致：天空盒在 DRAW_TYPE_NORMAL 与 DRAW_TYPE_SKYBOX 两个 pass 都会绘制。
+class SkyBox extends Sprite3D
+{
+    var m_pSkyBoxBuffer = null;   // CLibArrayData(32 floats) = 2×float4x4
+
+    // faces：可选，6 个 cubemap 面图路径（顺序 +X,-X,+Y,-Y,+Z,-Z，对齐 C++）
+    //         不传或文件缺失时生成程序化渐变天空
+    function SkyBox(faces = null)
+    {
+        super();
+        m_Mesh = new Mesh();
+
+        m_pSkyBoxBuffer = new CLibArrayData(new CLibArray("float", 32));
+
+        // ---- 立方体网格（仅位置，stride=12，配合 skybox 的 pos-only 输入布局）----
+        m_Mesh.m_Positions = [
+            -0.5, -0.5, -0.5,   0.5, -0.5, -0.5,   0.5,  0.5, -0.5,  -0.5,  0.5, -0.5,
+            -0.5, -0.5,  0.5,   0.5, -0.5,  0.5,   0.5,  0.5,  0.5,  -0.5,  0.5,  0.5
+        ];
+        m_Mesh.m_PositionsCnt = m_Mesh.m_Positions.size();
+        m_Mesh.m_Indices = [
+            0,1,2, 0,2,3,       // 后(-Z)
+            4,6,5, 4,7,6,       // 前(+Z)
+            0,3,7, 0,7,4,       // 左(-X)
+            1,5,6, 1,6,2,       // 右(+X)
+            0,4,5, 0,5,1,       // 下(-Y)
+            3,2,6, 3,6,7        // 上(+Y)
+        ];
+        m_Mesh.m_IndicesCnt = m_Mesh.m_Indices.size();
+        m_Mesh.Finalize();
+    }
+
+    // 正向渲染时天空盒在 DRAW_TYPE_NORMAL pass 绘制（C++ 正向无独立 pass）；
+    // 守卫同时接受 DRAW_TYPE_SKYBOX，以备延迟渲染分支单独 Scene::Darw(v, DRAW_TYPE_SKYBOX)。
+    function Darw(v, t)
+    {        
+        if (m_Material == null || (t != DRAW_TYPE_NORMAL && t != DRAW_TYPE_SKYBOX)) return;
+        if (m_Mesh.m_pVertexBuffer == null) return;
+
+        var ctx = g_d3d.m_Context;
+        // 注意：CullFace / DepthLess / DepthLessEqual 是 Render3DCatch 的方法（全局 g_render3DCatch），
+        // 不是 ID3D11DeviceContext 的方法。C++ 里也是 Render3DCatch::get()->... 调用的。
+        g_render3DCatch.CullFace(false);        // 天空盒关闭背面剔除（内表面需可见）
+        g_render3DCatch.DepthLessEqual();       // 写入远平面深度（配合 VS 的 posH.z = posH.w）
+
+        var shader = g_shaderManager.GetShader(SHADER_TYPE_SKYBOX);
+	    shader.use();
+
+        // 只取旋转部分（去掉平移），让天空盒始终以相机为中心
+        var cam = v.GetCamera();
+        var viewA = cam.GetViewMatrix().array();    
+        viewA[12] = 0; viewA[13] = 0; viewA[14] = 0;
+        
+        var projA = glm::perspective(glm::radians(cam.Zoom), v.m_AspectRatio, 0.1, 100.0).array();
+
+
+        for (var i = 0; i < 16; i++)
+        {
+            m_pSkyBoxBuffer.setFloat(i,      viewA[i]);
+            m_pSkyBoxBuffer.setFloat(16 + i, projA[i]);
+        }
+  
+        ctx.UpdateSubresource(shader.GetConstantBuffer(0), 0, null, m_pSkyBoxBuffer.addr(), 0, 0);
+        ctx.VSSetConstantBuffers(2, 1, shader.GetConstantBuffer(0).GetAddressOf());   // register(b2)
+
+        // 绑定 cubemap（从材质取，对应 C++ normalMaterial->m_DiffuseTexture）
+        // 与 C++ 一致：PSSetShaderResources + PSSetSamplers，均由 Texture.Bind 一并完成。
+        var albedoTex = m_Material.GetAlbedoTexture();
+        if (albedoTex != null)
+            albedoTex.Bind(0, ctx);   // PSSetShaderResources(slot0) + PSSetSamplers(slot0)
+
+        ctx.IASetVertexBuffers(0, 1,m_Mesh.m_pVertexBuffer.GetAddressOf(), m_Mesh.m_Stride, m_Mesh.m_Offset);
+        ctx.IASetIndexBuffer(m_Mesh.m_pIndexBuffer, DXGI_FORMAT_R32_UINT, 0);
+        ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx.DrawIndexed(m_Mesh.m_IndicesCnt, 0, 0);
+
+        // 恢复状态，交给随后的主场景绘制
+        g_render3DCatch.DepthLess();
+        g_render3DCatch.CullFace(true);
+    }
+}

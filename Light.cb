@@ -1,0 +1,266 @@
+// Light.cb —— 对应 d3dcdemo/Light.h
+// 灯光类层级：Light : Sprite3D（与 C++ 一致，CBrother 支持 extends）
+import sprite3d.cb   // Sprite3D
+import LightManager.cb  // g_lightManager 单例
+
+// ---- 灯光类型 (对应 C++ LightType) ----
+const LIGHT_TYPE_AMBIENT   = 0;
+const LIGHT_TYPE_POINTER   = 1;
+const LIGHT_TYPE_DIRECTION = 2;
+
+// ---- 点光源衰减距离档位 (对应 C++ PointLightAttenuaType) ----
+const PLA_0    = 0;
+const PLA_7    = 7;
+const PLA_13   = 13;
+const PLA_20   = 20;
+const PLA_32   = 32;
+const PLA_50   = 50;
+const PLA_65   = 65;
+const PLA_100  = 100;
+const PLA_160  = 160;
+const PLA_200  = 200;
+const PLA_325  = 325;
+const PLA_600  = 600;
+const PLA_3250 = 3250;
+
+
+// =============================================================================
+// Light：灯光基类（继承 Sprite3D，获得 m_Position / m_Model 等变换能力）
+// =============================================================================
+class Light extends Sprite3D
+{
+    var m_Type          = LIGHT_TYPE_AMBIENT;
+    var m_AmbientColor  = [1.0, 1.0, 1.0, 1.0];
+    var m_DiffuseColor  = [1.0, 1.0, 1.0, 1.0];
+    var m_SpecularColor = [1.0, 1.0, 1.0, 1.0];
+    var m_CastShadows   = 0;     // 0=不投影；>0=阴影图槽位 (1..N)
+
+    function Light()
+    {
+        super();
+    }
+
+    // 入参为 0..255 整数色（对应 C++ glm::uvec3，需 /255）
+    function SetAmbientColor(r, g, b)  { m_AmbientColor  = [r/255.0, g/255.0, b/255.0, 1.0]; }
+    function SetDiffuseColor(r, g, b)  { m_DiffuseColor  = [r/255.0, g/255.0, b/255.0, 1.0]; }
+    function SetSpecularColor(r, g, b) { m_SpecularColor = [r/255.0, g/255.0, b/255.0, 1.0]; }
+
+    // 开启/关闭阴影：开启时从 LightManager 领取一个阴影图槽位（对应 C++ Light::SetCastShadows）
+    function SetCastShadows(enable)
+    {
+        if (enable)
+        {
+            if (m_CastShadows != 0) return;
+            m_CastShadows = g_lightManager.GetFreeShadowMapIdx();
+        }
+        else
+        {
+            if (m_CastShadows != 0)
+            {
+                g_lightManager.AddFreeShadowMapIdx(m_CastShadows);
+                m_CastShadows = 0;
+            }
+        }
+    }
+    function GetShadowMapIndex() { return m_CastShadows; }
+}
+
+
+// =============================================================================
+// AmbientLight：环境光（仅 m_AmbientColor）
+// =============================================================================
+class AmbientLight extends Light
+{
+    function AmbientLight()
+    {
+        super();
+        m_Type = LIGHT_TYPE_AMBIENT;
+    }
+}
+
+
+// =============================================================================
+// PointLight：点光源（位置 + 衰减 + 颜色）
+// =============================================================================
+class PointLight extends Light
+{
+    var m_Point         = [0.0, 0.0, 0.0, 1.0];  // 世界坐标(vec4)，由 UpdateTransform 计算
+    var attenuationDist = 0;
+    var m_Attenua       = PLA_0;                  // 衰减档位（对应 C++ m_Attenua）
+
+    function PointLight(r = 255, g = 255, b = 255)
+    {
+        super();
+        m_Type          = LIGHT_TYPE_POINTER;
+        SetDiffuseColor(r, g, b);
+        SetSpecularColor(r, g, b);
+        m_Point         = [0.0, 0.0, 0.0, 1.0];
+        m_Attenua       = PLA_0;
+    }
+
+    // 覆盖基类：先更新模型矩阵，再把世界坐标写入 m_Point（对应 C++ PointLight::UpdateTransform）
+    virtual function UpdateTransform(force)
+    {
+        if (!m_IsChanged)
+        {
+            return;            
+        }
+        var changed = m_IsChanged;
+        super.UpdateTransform(force);
+        if (changed)
+        {
+            // m_Point = m_Model * (0,0,0,1) -> 平移分量即世界坐标（列主序数组的 12..15 列）
+            var mx = m_Model.array();
+            m_Point = [mx[12], mx[13], mx[14], mx[15]];
+        }
+    }
+
+    // 返回 [linear, quadratic] 衰减系数（对应 C++ PointLight::GetAttenuaParm）
+    function GetAttenuaParm()
+    {
+        if (m_Attenua == PLA_7)    return [0.7, 1.8];
+        if (m_Attenua == PLA_13)   return [0.35, 0.44];
+        if (m_Attenua == PLA_20)   return [0.22, 0.20];
+        if (m_Attenua == PLA_32)   return [0.14, 0.07];
+        if (m_Attenua == PLA_50)   return [0.09, 0.032];
+        if (m_Attenua == PLA_65)   return [0.07, 0.017];
+        if (m_Attenua == PLA_100)  return [0.045, 0.0075];
+        if (m_Attenua == PLA_160)  return [0.027, 0.0028];
+        if (m_Attenua == PLA_200)  return [0.022, 0.0019];
+        if (m_Attenua == PLA_325)  return [0.014, 0.0007];
+        if (m_Attenua == PLA_600)  return [0.007, 0.0002];
+        if (m_Attenua == PLA_3250) return [0.0014, 0.000007];
+        return [0.0, 0.0];
+    }
+
+    function SetAttenuation(attenua)
+    {
+        m_Attenua = attenua;
+    }
+}
+
+
+// =============================================================================
+// DirectionLight：方向光（平行光）—— 含光源视锥矩阵与阴影深度图
+// =============================================================================
+class DirectionLight extends Light
+{
+    var m_Direction           = [0.0, 0.0, 1.0, 1.0];  // 指向（由位置归一化得到）
+    var m_LightProjection      = new glm::Mat4();        // 光源投影（正交）
+    var m_LightView            = new glm::Mat4();        // 光源视图（lookAt）
+    var m_DepthMapBuffer       = null;                   // ID3D11DepthStencilView
+    var m_DepthMapResourceView = null;                   // ID3D11ShaderResourceView（供采样）
+    var m_DepthMap             = null;                   // ID3D11Texture2D
+
+    function DirectionLight(r = 255, g = 255, b = 255)
+    {
+        super();
+        m_Type          = LIGHT_TYPE_DIRECTION;
+        SetDiffuseColor(r, g, b);
+        SetSpecularColor(r, g, b);
+        m_Direction     = [0.0, 0.0, 1.0, 1.0];
+        m_CastShadows   = 0;
+        m_LightProjection = glm::ortho(-20.0, 20.0, -20.0, 20.0, 0.1, 100.0);
+        m_LightView       = glm::lookAt(m_Position, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+    }
+
+    // 覆盖基类：方向 = -normalize(位置)，并重算光源视锥矩阵（对应 C++ DirectionLight::UpdateTransform）
+    virtual function UpdateTransform(force)
+    {
+        if (!m_IsChanged)
+        {
+            return;            
+        }
+
+        var changed = m_IsChanged;
+        super.UpdateTransform(force);
+        if (changed)
+        {
+            var px = m_Position.x(); var py = m_Position.y(); var pz = m_Position.z();
+            var len = math::sqrt(px*px + py*py + pz*pz);
+            if (len > 0.0001)
+                m_Direction = [-px/len, -py/len, -pz/len, 1.0];
+            else
+                m_Direction = [0.0, 0.0, -1.0, 1.0];
+            m_LightProjection = glm::ortho(-20.0, 20.0, -20.0, 20.0, 0.1, 100.0);
+            m_LightView       = glm::lookAt(m_Position, glm::vec3(0, 0, 0), glm::vec3(0, 1, 0));
+        }
+    }
+
+    // 创建阴影深度图（对应 C++ DirectionLight::CreateDepthMap）
+    function CreateDepthMap()
+    {
+        if (m_CastShadows == 0 || m_DepthMapBuffer != null) return;
+        var device = g_d3d.m_Device;
+
+        var tdesc = new D3D11_TEXTURE2D_DESC();
+        // 必须用 TYPELESS：typed 深度格式(D24S8)不允许 BIND_SHADER_RESOURCE，
+        // CreateTexture2D 会直接失败。与 C++ 一致用 R24G8_TYPELESS。
+        tdesc.SetFormat(DXGI_FORMAT_R24G8_TYPELESS);
+        tdesc.SetUsage(D3D11_USAGE_DEFAULT);
+        tdesc.SetArraySize(1);
+        tdesc.SetMipLevels(1);
+        tdesc.SetSampleCount(1);
+        tdesc.SetSampleQuality(0);
+        tdesc.SetHeight(LIGHT_DEPTH_MAP_SIZE);
+        tdesc.SetWidth(LIGHT_DEPTH_MAP_SIZE);
+        tdesc.SetBindFlags(D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE);
+        tdesc.SetCPUAccessFlags(0);
+        tdesc.SetMiscFlags(0);
+
+        m_DepthMap = device.CreateTexture2D(tdesc, null);
+
+        var srvDesc = new D3D11_SHADER_RESOURCE_VIEW_DESC();
+        // D24S8 的可着色采样格式
+        srvDesc.SetFormat(DXGI_FORMAT_R24_UNORM_X8_TYPELESS);
+        srvDesc.SetViewDimension(D3D11_SRV_DIMENSION_TEXTURE2D);
+        srvDesc.SetMostDetailedMip(0);
+        srvDesc.SetMipLevels(-1);
+        m_DepthMapResourceView = device.CreateShaderResourceView(m_DepthMap, srvDesc);
+
+        // TYPELESS 纹理无法推断 DSV 格式，必须显式指定 D24S8
+        // （对应 C++ CD3D11_DEPTH_STENCIL_VIEW_DESC(TEXTURE2D, D24_UNORM_S8_UINT)）
+        var dsvDesc = new D3D11_DEPTH_STENCIL_VIEW_DESC();
+        dsvDesc.SetFormat(DXGI_FORMAT_D24_UNORM_S8_UINT);
+        dsvDesc.SetViewDimension(D3D11_DSV_DIMENSION_TEXTURE2D);
+        dsvDesc.SetFlags(0);
+        dsvDesc.SetMipSlice(0);
+        m_DepthMapBuffer = device.CreateDepthStencilView(m_DepthMap, dsvDesc);
+    }
+
+    var m_D3d11ViewPort = new D3D11_VIEWPORT();
+    // 绑定阴影深度图为当前深度目标（无颜色 RT），清深度，切阴影视口（对应 C++ BindDepthMap）
+    function BindDepthMap()
+    {
+        if (m_CastShadows == 0) return;
+        if (m_DepthMapBuffer == null) 
+        {
+            CreateDepthMap();          
+        }
+        
+        var ctx = g_d3d.m_Context;
+
+        // 先解绑同槽 SRV（置 null）
+        // 阴影 pass 已改用深度专用 shader（无 PS），不会采样该 null 槽位，故无死锁风险。
+        ctx.PSSetShaderResources(4 + m_CastShadows, 0, null);
+
+        ctx.ClearDepthStencilView(m_DepthMapBuffer, D3D11_CLEAR_DEPTH_STENCIL, 1.0, 0);
+
+        // 仅绑定 DSV（RTV 为 null），渲染几何深度进入阴影图
+        ctx.OMSetRenderTargets(0,null, m_DepthMapBuffer);
+
+        m_D3d11ViewPort.SetTopLeftX(0.0);
+        m_D3d11ViewPort.SetTopLeftY(0.0);
+        m_D3d11ViewPort.SetWidth(LIGHT_DEPTH_MAP_SIZE);
+        m_D3d11ViewPort.SetHeight(LIGHT_DEPTH_MAP_SIZE);
+        m_D3d11ViewPort.SetMinDepth(0.0);
+        m_D3d11ViewPort.SetMaxDepth(1.0);  
+        ctx.RSSetViewports(m_D3d11ViewPort);
+    }
+
+    function UnbindDepthMap()
+    {
+        var ctx = g_d3d.m_Context;
+        ctx.OMSetRenderTargets(1,g_d3d.m_Rtv.GetAddressOf(), g_d3d.m_Dsv);
+    }
+}

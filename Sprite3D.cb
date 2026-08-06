@@ -1,0 +1,260 @@
+// sprite3d.cb — CBrother 版 Sprite3D 类
+// 对应 d3dcdemo/Sprite3D.h (+ Sprite.h / DObject.h 的继承成员，内联)
+// 已接入 Material / Shader：Darw 时绑定材质（shader + 贴图 + 采样器）
+
+import mesh.cb
+import Material.cb
+import MaterialManager.cb
+import TextureManager.cb
+import define.cb
+import view3d.cb          // DRAW_TYPE_NORMAL / DRAW_TYPE_DEPTH
+
+// 每对象常量缓冲的“数据容器”放在 sprite3d 的全局变量里（纯 CPU 内存，懒初始化）。
+// 真正的 ID3D11Buffer* 与绑定指针属于 Shader（m_ConstantBuffers / m_ConstantBufferPtrs），
+// 由 ShaderManager 在创建管线时提前建好，渲染时直接取用（对应 C++ m_ConstantBuffers）。
+//   VS slot 2 用 shader.GetConstantBuffer(0)    （VsNormalBuffer，80 字节 / 20 float）
+//   PS slot 3 用 shader.GetConstantBuffer(1)    （PsNormalBuffer，48 字节 / 12 float）
+var _worldCBData = null;   // CLibArrayData(20 个 float = 80 字节)
+var _psCBData    = null;   // CLibArrayData(12 个 float = 48 字节)
+
+function _ensureCBData()
+{
+    if (_worldCBData != null) return;
+    _worldCBData = new CLibArrayData(new CLibArray("float", 20));
+    _psCBData    = new CLibArrayData(new CLibArray("float", 12));
+}
+
+// 默认采样器（线性 + Wrap，对应 C++ 漫反射贴图自带的 sampler state），供所有贴图共用 t0
+var _sampState = null;
+function _ensureSampler()
+{
+    if (_sampState != null) return;
+    var sdesc = new D3D11_SAMPLER_DESC();
+    sdesc.SetFilter(D3D11_FILTER_MIN_MAG_MIP_LINEAR);
+    sdesc.SetAddressU(D3D11_TEXTURE_ADDRESS_WRAP);
+    sdesc.SetAddressV(D3D11_TEXTURE_ADDRESS_WRAP);
+    sdesc.SetAddressW(D3D11_TEXTURE_ADDRESS_WRAP);
+    sdesc.SetComparisonFunc(D3D11_COMPARISON_NEVER);
+    sdesc.SetMinLOD(0);
+    sdesc.SetMaxLOD(D3D11_FLOAT32_MAX);
+    _sampState = g_d3d.m_Device.CreateSamplerState(sdesc);
+}
+
+
+// 灯光类 (Light / AmbientLight / PointLight / DirectionLight) 见 Light.cb
+// （对应 d3dcdemo/Light.h；Light : public Sprite3D，故 Light.cb 需 import 本文件）
+
+class Sprite3D
+{
+    // ============ 变换 ============
+    var m_Position   = glm::vec3(0, 0, 0);
+    var m_Rotation   = glm::vec3(0, 0, 0);    // 派生欧拉角 (弧度)，仅供查看；真正旋转用 m_RotationQuat
+    var m_RotationQuat = glm::quatIdentity(); // 旋转四元数 (累积旋转，对应 C++ m_RotationQuat)
+    var m_Scale      = glm::vec3(1, 1, 1);
+    var m_Model      = null;               // Mat4 (局部模型矩阵)
+    var m_IsChanged  = true;
+
+    // ============ 场景图 (DObject/Sprite) ============
+    var m_Parent     = null;
+    var m_Children   = [];
+    var m_Visable    = true;
+    var m_Layer      = 0;
+    var m_Name       = "";
+    var m_Index      = 0;
+
+    // ============ 几何 ============
+    var m_Mesh       = null;              // Mesh
+
+    // ============ 渲染状态 ============
+    var m_DrawType   = 0;                // 0=d3d 1=gl 2=skybox
+    var m_NodeType   = 0;
+    var m_Depth      = 0.0;
+    var m_Color      = [1.0, 1.0, 1.0, 1.0];   // XMFLOAT4
+
+    // ============ Material / Shader ============
+    var m_Material   = null;             // Material*（普通/蒙皮/GBuffer 等）
+    var m_LightBlend = true;             // 是否参与光照混合（对应 C++ m_LightBlend）
+
+    // 静态灯光表 (预留)
+    var m_Lights     = [];
+
+    function Sprite3D()
+    {
+    }
+
+    // ============ 变换接口 ============
+    function SetPosition(x, y, z) { m_Position = glm::vec3(x, y, z); m_IsChanged = true; }
+    function SetScale(x, y, z)    { m_Scale    = glm::vec3(x, y, z); m_IsChanged = true; }
+    function SetRotation(x, y, z) { m_Rotation = glm::vec3(x, y, z); m_RotationQuat = glm::eulerToQuat(m_Rotation); m_IsChanged = true; }
+
+    // 累积旋转 (对应 C++ Sprite3D::Rotate): 在物体/局部坐标系下叠加 angle(度) 绕轴 v 的旋转
+    function Rotate(angle, v)
+    {
+        m_RotationQuat = glm::quatRotate(m_RotationQuat, glm::radians(angle), v);
+        m_Rotation = glm::quatEulerAngles(m_RotationQuat);   // 派生欧拉角(弧度)
+        m_IsChanged = true;
+    }
+    // 直接设置四元数 (对应 C++ Sprite3D::SetRotationQuat)
+    function SetRotationQuat(q) { m_RotationQuat = q.copy(); m_Rotation = glm::quatEulerAngles(m_RotationQuat); m_IsChanged = true; }
+    function GetRotationQuat()  { return m_RotationQuat; }
+
+    function GetPosition() { return m_Position; }
+    function GetModelBuffer() { return m_Model; }
+
+    // 计算局部 + 级联世界矩阵
+    function UpdateTransform()
+    {
+        if (!m_IsChanged)
+        {
+            return;            
+        }
+        m_Model = glm::mat4();                                        // 单位矩阵
+        m_Model.translate(m_Position.x(), m_Position.y(), m_Position.z());
+        m_Model.scale(m_Scale.x(), m_Scale.y(), m_Scale.z());
+
+        // 旋转矩阵：来自累积四元数 (对应 C++ glm::mat4_cast(m_RotationQuat))
+        var rot = glm::quatToMat4(m_RotationQuat);
+        // 对应原 m.mul(rot, m_Model)；glm::multiply(a,b) = a * b
+        m_Model = glm::multiply(rot, m_Model);
+
+        for (var i = 0; i < m_Children.size(); i++)
+        {
+            if (m_Children[i] != null)
+            {
+                m_Children[i].UpdateTransform();
+                // 对应原 child.mul(m_Model, childModel) = m_Model * childModel
+                m_Children[i].m_Model = glm::multiply(m_Model, m_Children[i].m_Model);
+            }
+        }
+        m_IsChanged = false;
+    }
+
+    // ============ 场景接口 ============
+    function addChild(child)
+    {
+        if (child == null) return;
+        child.m_Parent = this;
+        m_Children.append(child);
+    }
+    function SetVisable(v) { m_Visable = v; }
+
+    // ============ 几何 / 材质接口 ============
+    function SetMesh(mesh)           { m_Mesh = mesh; }
+    function SetMaterial(material)   { m_Material = material; }
+    function SetShader(shader)       { m_Shader = shader; }
+    function GetMaterial()           { return m_Material; }
+
+    // ============ 绘制 ============
+    // v: View3D (提供相机/视图投影矩阵), t: 渲染 pass 标记（1 = 深度/阴影 pass）
+    function Darw(v, t)
+    {
+        //print "11111111111111111111111 " + m_IsChanged + " " + m_Visable+ " " + m_Mesh;
+        if (!m_Visable) return;
+        if (m_Mesh == null) return;
+        if (m_Mesh.m_pVertexBuffer == null) return;
+        // 普通精灵响应 NORMAL / DEPTH / GBUFFER；SKYBOX / PICK 等由覆盖 Darw 的子类（如 SkyBox）自行处理
+        if (t != DRAW_TYPE_NORMAL && t != DRAW_TYPE_DEPTH && t != DRAW_TYPE_GBUFFER) return;
+        if (m_IsChanged) UpdateTransform();
+
+        var ctx = g_d3d.m_Context;
+
+        var shader = m_Material.GetShader();
+        // 对齐 C++ Sprite3D::Darw：阴影/深度 pass 用深度专用 shader（无 PS），
+        // 只写几何深度到阴影图，避免采样被置空的阴影 SRV 导致 GPU 死锁。
+        if (t == DRAW_TYPE_DEPTH)
+        {
+            var depthShader = m_Material.GetDepthMapShader();
+            if (depthShader != null)
+                shader = depthShader;
+            else
+            {
+                // 该材质无深度 shader：不参与阴影投射，仅递归子节点后返回
+                for (var i = 0; i < m_Children.size(); i++)
+                    if (m_Children[i] != null) m_Children[i].Darw(v, t);
+                return;
+            }
+        }
+        // 延迟渲染 GBuffer pass：用 GBuffer 专用 shader（Normal3D_VS + GBuffer.hlsl），
+        // 几何输出到 4 个 MRT（位置/法线/漫反射/高光）。
+        if (t == DRAW_TYPE_GBUFFER)
+        {
+            var gbShader = g_shaderManager.GetShader(SHADER_TYPE_GBUFFER);
+            if (gbShader != null)
+                shader = gbShader;
+        }
+        shader.use();
+
+        // ----- 每对象模型矩阵（对应 C++ VsNormalBuffer，绑定到 VS slot 2）-----
+        // view / proj 已由 Render3DCatch 的全局缓冲（VS slot 0）设置，此处只补 world
+        _ensureCBData();
+
+        var modelA = m_Model.array();                       // glm 列主序，直接传给 HLSL float4x4（无需转置）
+        for (var i = 0; i < 16; i++) _worldCBData.setFloat(i, modelA[i]);
+
+        // ----- 每对象 PS 常量缓冲（对应 C++ PsNormalBuffer，绑定到 PS slot 3）-----
+        // 仅普通材质走此分支（与 C++ Sprite3D::Darw 的 MATERIAL_NORMAL 分支一致）
+        if (m_Material.GetMaterialType() == MATERIAL_NORMAL)
+        {
+            _ensureSampler();
+
+            var color = m_Material.GetColor();
+
+            // 直接用材质中存储的 Texture 对象绑定 SRV（初始化时已赋值，无需每帧按 key 查找）
+            var albedoTex = m_Material.GetAlbedoTexture();
+            var specTex   = m_Material.GetSpecularTexture();
+            var normalTex = m_Material.GetNormalTexture();
+
+            var hasDiffuse  = 0.0;
+            var hasSpecular = 0.0;
+            var hasNormal   = 0.0;
+
+            // 漫反射贴图（t0）+ 采样器；无贴图时回退到纯色 colorRGB（与 C++ 一致）
+            if (albedoTex != null)
+            {
+                albedoTex.Bind(0, ctx);
+                hasDiffuse = 1.0;
+                ctx.PSSetSamplers(0, 1, _sampState.GetAddressOf());
+            }
+            if (specTex != null)  { specTex.Bind(1, ctx);  hasSpecular = 1.0; }
+            if (normalTex != null){ normalTex.Bind(2, ctx); hasNormal   = 1.0; }
+
+            // 填充 PsNormalBuffer（对应 C++ psBuffer.* 各字段）
+            _psCBData.setFloat(0, color.x());
+            _psCBData.setFloat(1, color.y());
+            _psCBData.setFloat(2, color.z());
+            _psCBData.setFloat(3, color.w());
+            _psCBData.setFloat(4, hasDiffuse);
+            _psCBData.setFloat(5, hasSpecular);
+            _psCBData.setFloat(6, hasNormal);
+
+            _worldCBData.setFloat(16, hasNormal);
+
+            var lightBlendF = 0.0;                                    // lightBlend（int）
+            if (m_LightBlend) lightBlendF = 1.0;
+            _psCBData.setFloat(7, lightBlendF);
+            _psCBData.setFloat(8, m_Material.GetSpecularStrength());
+            _psCBData.setFloat(9, m_Material.GetShininessStrength());
+
+            ctx.VSSetConstantBuffers(2, 1, shader.GetConstantBuffer(0).GetAddressOf());
+            ctx.PSSetConstantBuffers(3, 1, shader.GetConstantBuffer(1).GetAddressOf());
+            ctx.UpdateSubresource(shader.GetConstantBuffer(1), 0, null, _psCBData.addr(), 0, 0);
+        }
+
+        ctx.UpdateSubresource(shader.GetConstantBuffer(0), 0, null, _worldCBData.addr(), 0, 0);
+        ctx.IASetVertexBuffers(0, 1, m_Mesh.m_pVertexBuffer.GetAddressOf(), m_Mesh.m_Stride, m_Mesh.m_Offset);
+        ctx.IASetIndexBuffer(m_Mesh.m_pIndexBuffer, DXGI_FORMAT_R32_UINT, 0);
+        ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        // 整网格一次绘制
+        ctx.DrawIndexed(m_Mesh.m_IndicesCnt, 0, 0);
+
+        // 递归子节点
+        for (var i = 0; i < m_Children.size(); i++)
+        {
+            if (m_Children[i] != null) m_Children[i].Darw(v, t);
+        }
+    }
+
+    // 拾取占位 (TODO: 射线相交)
+    function Pick(rayOrigin, rayDir) { return false; }
+}

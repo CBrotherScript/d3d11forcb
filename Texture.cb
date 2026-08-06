@@ -1,0 +1,269 @@
+import lib/windows/Image.cb
+import define
+
+// =============================================================================
+// Texture：
+//   既能承载普通 2D 纹理（这里用 WIC），也能承载立方体贴图（cubemap）。
+//   成员: m_Width, m_Height, m_SRV, m_Sampler
+//   2D 用法:
+//     var tex = new Texture("res\\container2.png");
+//     tex.Bind(0, context);       // PSSetShaderResources(slot=0) + sampler
+//   Cubemap 用法（对齐 C++ 的 Texture(faces) / LoadTextureCube）:
+//     var cube = new Texture();
+//     cube.LoadTextureCube([right,left,top,bottom,front,back]); // 顺序 +X,-X,+Y,-Y,+Z,-Z
+//     var cube2 = new Texture();
+//     cube2.LoadTextureCubeProcedural();                        // 无素材时程序化渐变天空
+//   说明: WICImage 需要 COM 已初始化(CoInitializeEx)，请在程序启动时调用一次。
+// =============================================================================
+
+const TEX_BIND_SHADER_RESOURCE = 8;   // D3D11_BIND_SHADER_RESOURCE
+const TEX_CPU_ACCESS_NONE      = 0;
+const TEX_BIND_RENDER_TARGET   = 32;  // D3D11_BIND_RENDER_TARGET（cubemap 与 C++ 一致）
+
+class Texture
+{
+    var m_Width = 0;
+    var m_Height = 0;
+    var m_Stride = 0;
+    var m_nChannels = 4;
+    var m_FilePath = "";
+    var m_Pixels = null;
+    var m_SRV = null;        // SRV 接口地址(int)（C++ m_pTextureResourceView）
+    var m_Sampler = null;    // ID3D11SamplerState*（C++ m_pSamplerState）
+    var m_CubeTex = null;    // ID3D11Texture2D（cubemap 资源，保持生命周期）
+    var m_IsCube = 0;        // 是否为 cubemap
+
+    // 2D 纹理构造：传入图片路径（对应 C++ Texture(const char*)）。
+    // 不传路径则创建一个空的 Texture，再由 LoadTextureCube 接管（对应 C++ Texture(vector)）。
+    function Texture(filePath)
+    {
+        m_FilePath = filePath;
+        if (filePath != null && filePath != "" && Load() == 1)
+        {
+            CreateTexture(g_d3ddevice);
+            CreateSampler();
+        }
+    }
+
+    // 用 WIC 把图片解码成 RGBA（对应 Texture.h 里用 stb_image_load 读取 m_pixelDataTex）
+    function Load()
+    {
+        var img = new WICImage();
+        if (img.Load(m_FilePath) != 1)
+        {
+            print "Texture.Load failed: " + m_FilePath;
+            return 0;
+        }
+        m_Width     = img.m_Width;
+        m_Height    = img.m_Height;
+        m_Stride = img.m_Stride;
+        m_nChannels = 4;
+        m_Pixels    = img.m_PixelData;
+        img.Release();   // WIC 解码接口用完即释放（像素数据已拷到 m_Pixels）
+        return 1;
+    }
+
+    // 在 GPU 上创建 Texture2D + SRV（对应 Texture.h 的 CreateTexture）
+    function CreateTexture(device)
+    {
+        var desc = new D3D11_TEXTURE2D_DESC();
+        desc.SetWidth(m_Width);
+        desc.SetHeight(m_Height);
+        desc.SetMipLevels(1);
+        desc.SetArraySize(1);
+        desc.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+        desc.SetSampleCount(1);
+        desc.SetSampleQuality(0);
+        desc.SetUsage(D3D11_USAGE_DEFAULT);
+        desc.SetBindFlags(TEX_BIND_SHADER_RESOURCE);
+        desc.SetCPUAccessFlags(TEX_CPU_ACCESS_NONE);
+        desc.SetMiscFlags(0);
+
+        var sd = new D3D11_SUBRESOURCE_DATA();
+        sd.SetSysMem(m_Pixels);
+        sd.SetSysMemPitch(m_Stride);
+        sd.SetSysMemSlicePitch(0);
+
+        var tex = device.CreateTexture2D(desc, sd);
+        if (tex == null) { print "CreateTexture2D failed 1111"; return 0; }
+
+        var srvDesc = new D3D11_SHADER_RESOURCE_VIEW_DESC();
+        srvDesc.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+        srvDesc.SetViewDimension(D3D11_SRV_DIMENSION_TEXTURE2D);
+        srvDesc.SetMostDetailedMip(0);
+        srvDesc.SetMipLevels(1);
+
+        m_SRV = device.CreateShaderResourceView(tex, srvDesc);
+        if (m_SRV == null) { print "CreateShaderResourceView failed"; return 0; }
+        tex.Release();   // CreateTexture2D 内部 AddRef，释放这份引用（SRV 已持有资源）
+        return 1;
+    }
+
+    // -------------------------------------------------------------------------
+    // Cubemap：对应 C++ Texture::LoadTextureCube(vector<std::string>&)
+    //   faces 顺序与 C++ 一致：+X,-X,+Y,-Y,+Z,-Z（即 right,left,top,bottom,front,back）
+    // -------------------------------------------------------------------------
+    function LoadTextureCube(faces)
+    {
+        if (faces == null || faces.size() != 6)
+        {
+            print "Texture.LoadTextureCube: 需要正好 6 个面";
+            return 0;
+        }
+
+        var imgs = new Array();
+        var w = 0, h = 0;
+        for (var i = 0; i < 6; i++)
+        {
+            var img = new WICImage();
+            if (img.Load(faces[i]) != 1)
+            {
+                print "Texture.LoadTextureCube: 加载失败: " + faces[i];
+                for (var k = 0; k < imgs.size(); k++) imgs[k].Release();
+                return 0;
+            }
+            if (i == 0) { w = img.m_Width; h = img.m_Height; }
+            else if (img.m_Width != w || img.m_Height != h)
+            {
+                print "Texture.LoadTextureCube: 六面尺寸不一致，已取消";
+                for (var k = 0; k <= i; k++) imgs[k].Release();
+                return 0;
+            }
+            imgs.add(img);
+        }
+
+        _createCubeTexture(w, h);
+        if (m_SRV == null || m_SRV == 0)
+        {
+            for (var k = 0; k < 6; k++) imgs[k].Release();
+            return 0;
+        }
+        for (var i = 0; i < 6; i++)
+            g_d3d.m_Context.UpdateSubresource(m_CubeTex, i, null, imgs[i].m_PixelData, imgs[i].m_Stride, 0);
+        CreateSampler();
+        for (var k = 0; k < 6; k++) imgs[k].Release();
+        m_IsCube = 1;
+        return 1;
+    }
+
+    // 程序化渐变天空（无素材时的回退，等价于给 6 个面生成渐变图再走 LoadTextureCube 的 GPU 流程）
+    function LoadTextureCubeProcedural()
+    {
+        var size = 128;   // 渐变天空盒无需 512：256 已足够平滑，CPU/显存占用降为 1/4（128 也可）
+        var w = size, h = size;
+        var stride = w * 4;
+
+        // 立方体只有 3 种面：侧面(前后左右完全相同，渐变只随 y 变化)、顶面、底面。
+        // 因此只生成 3 张缓冲，6 个面上传时复用，避免重复 4 份逐像素计算与内存。
+        var sideBuf   = new CLibPointer(); sideBuf.malloc(h * stride);
+        var topBuf    = new CLibPointer(); topBuf.malloc(h * stride);
+        var bottomBuf = new CLibPointer(); bottomBuf.malloc(h * stride);
+
+        // 侧面渐变三段颜色（天顶->地平线->地面）
+        var r0=0.25, g0=0.50, b0=0.92;
+        var r1=0.85, g1=0.88, b1=0.92;
+        var r2=0.30, g2=0.27, b2=0.22;
+
+        // 侧面：只生成一张（四个侧面共用）
+        for (var y = 0; y < h; y++)
+        {
+            var v = (y + 0.5) / h;
+            var rr, gg, bb;
+            if (v < 0.5) { var t = v / 0.5;       rr = r0 + (r1 - r0) * t; gg = g0 + (g1 - g0) * t; bb = b0 + (b1 - b0) * t; }
+            else         { var t = (v - 0.5)/0.5; rr = r1 + (r2 - r1) * t; gg = g1 + (g2 - g1) * t; bb = b1 + (b2 - b1) * t; }
+            var val = INT(rr * 255) + INT(gg * 255) * 256 + INT(bb * 255) * 65536 + 255 * 16777216;
+            var base = y * w * 4;
+            for (var x = 0; x < w; x++) sideBuf.setInt(base + x * 4, val);
+        }
+        // 顶面：整面纯色
+        var topVal = INT(0.25*255) + INT(0.50*255)*256 + INT(0.92*255)*65536 + 255*16777216;
+        for (var y = 0; y < h; y++) { var base = y * w * 4; for (var x = 0; x < w; x++) topBuf.setInt(base + x * 4, topVal); }
+        // 底面：整面纯色
+        var botVal = INT(0.30*255) + INT(0.27*255)*256 + INT(0.22*255)*65536 + 255*16777216;
+        for (var y = 0; y < h; y++) { var base = y * w * 4; for (var x = 0; x < w; x++) bottomBuf.setInt(base + x * 4, botVal); }
+
+        _createCubeTexture(w, h);
+        if (m_SRV == null || m_SRV == 0) return 0;
+        // 6 个面顺序 +X,-X,+Y,-Y,+Z,-Z -> 侧面,侧面,顶,底,侧面,侧面（复用同一份缓冲）
+        for (var i = 0; i < 6; i++)
+        {
+            if (i == 2) var src = topBuf;
+            else if (i == 3) src = bottomBuf;
+            else src = sideBuf;
+            g_d3d.m_Context.UpdateSubresource(m_CubeTex, i, null, src, stride, 0);
+        }
+        CreateSampler();
+        m_IsCube = 1;
+        return 1;
+    }
+
+    // 创建 ArraySize=6 + MISC_TEXTURECUBE 的立方体纹理，并建立 cubemap SRV（对应 C++ LoadTextureCube 的建纹理+建 SRV）
+    function _createCubeTexture(w, h)
+    {
+        var fd = new D3D11_TEXTURE2D_DESC();
+        fd.SetWidth(w);
+        fd.SetHeight(h);
+        fd.SetMipLevels(1);
+        fd.SetArraySize(6);
+        fd.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+        fd.SetSampleCount(1);
+        fd.SetSampleQuality(0);
+        fd.SetUsage(D3D11_USAGE_DEFAULT);
+        fd.SetBindFlags(TEX_BIND_SHADER_RESOURCE | TEX_BIND_RENDER_TARGET);
+        fd.SetCPUAccessFlags(TEX_CPU_ACCESS_NONE);
+        fd.SetMiscFlags(D3D11_RESOURCE_MISC_TEXTURECUBE);
+
+        m_CubeTex = g_d3d.m_Device.CreateTexture2D(fd, null);
+        if (m_CubeTex == 0 || m_CubeTex == null)
+        {
+            print "TextureCube: CreateTexture2D 失败";
+            return 0;
+        }
+
+        
+        var desc = m_CubeTex.GetDesc();
+        print "TextureCube: 创建成功，尺寸 " + desc.GetWidth() + "x" + desc.GetHeight() + "x" + desc.GetArraySize();
+
+        var sd = new D3D11_SHADER_RESOURCE_VIEW_DESC();
+        sd.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+        sd.SetViewDimension(D3D11_SRV_DIMENSION_TEXTURECUBE);
+        sd.SetMostDetailedMip(0);
+        sd.SetMipLevels(4294967295);
+        m_SRV = g_d3d.m_Device.CreateShaderResourceView(m_CubeTex, sd);
+        if (m_SRV == 0 || m_SRV == null)
+            print "TextureCube: CreateShaderResourceView 失败";
+    }
+
+    // 初始化采样器状态（对应 C++ Texture::Load / LoadTextureCube 里创建 m_pSamplerState）
+    function CreateSampler()
+    {
+        var sdesc = new D3D11_SAMPLER_DESC();
+        sdesc.SetFilter(D3D11_FILTER_MIN_MAG_MIP_LINEAR);
+        sdesc.SetAddressU(D3D11_TEXTURE_ADDRESS_WRAP);
+        sdesc.SetAddressV(D3D11_TEXTURE_ADDRESS_WRAP);
+        sdesc.SetAddressW(D3D11_TEXTURE_ADDRESS_WRAP);
+        sdesc.SetComparisonFunc(D3D11_COMPARISON_NEVER);
+        sdesc.SetMinLOD(0);
+        sdesc.SetMaxLOD(D3D11_FLOAT32_MAX);
+
+        m_Sampler = g_d3d.m_Device.CreateSamplerState(sdesc);
+        if (m_Sampler == 0 || m_Sampler == null)
+            print "Texture: CreateSamplerState 失败";
+    }
+
+    // 绑定到像素着色器采样器槽（对应 C++ SkyBox 里 PSSetShaderResources + PSSetSamplers）
+    function Bind(slot, context)
+    {
+        if (m_SRV != null)
+        {
+            context.PSSetShaderResources(slot, 1, m_SRV.GetAddressOf());
+        }
+        if (m_Sampler != null)
+        {
+            context.PSSetSamplers(slot, 1, m_Sampler.GetAddressOf());
+        }
+    }
+
+    function getSRV()     { return m_SRV; }
+    function getSampler() { return m_Sampler; }
+}

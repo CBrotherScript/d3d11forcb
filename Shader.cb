@@ -1,0 +1,131 @@
+// Shader.cb — CBrother 版 Shader 类
+// 对应 d3dcdemo/Shader.h
+// 构造时传入 .hlsl 路径，内部通过 d3dUtil.cb 的 CreateShaderFromFile
+// (D3DCompileFromFile + 系统 #include 处理器) 编译 VS/PS 并创建输入布局
+
+import lib/windows/d3d11
+import d3ddevice.cb
+import d3dUtil.cb
+
+// 着色器类型 (对应 Shader.h 的 ShaderType 枚举，从 0 起)
+const SHADER_TYPE_2D                  = 0;
+const SHADER_TYPE_3D_NORMAL           = 1;
+const SHADER_TYPE_3D_SKINNED         = 2;
+const SHADER_TYPE_SKYBOX              = 3;
+const SHADER_TYPE_DEPTH               = 4;
+const SHADER_TYPE_DEPTH_SKINNED      = 5;
+const SHADER_TYPE_GBUFFER             = 6;
+const SHADER_TYPE_DEFERRED            = 7;   // 延迟着色合成（Basic_2D_VS + DeferredShading）
+
+class Shader
+{
+    var ID         = 0;
+    var IsSuccess  = false;
+    var m_Type     = 0;
+
+    var m_pVertexLayout = null;   // ID3D11InputLayout*
+    var m_pVertexShader  = null;  // ID3D11VertexShader*
+    var m_pPixelShader   = null;  // ID3D11PixelShader*
+
+    var m_ConstantBuffers    = [null, null, null];   // ID3D11Buffer*[3]（提前创建的常量缓冲）
+    //var m_ConstantBufferPtrs = [null, null, null];   // ID3D11Buffer** 包装（绑定用）[3]
+
+    // vertexPath / fragmentPath: .hlsl 文件路径
+    // inputLayout: D3D11_INPUT_ELEMENT_DESC 的 CBrother 数组
+    // numElements: 输入元素个数
+    // vsEntry / psEntry: 着色器入口函数名 (默认 "VS" / "PS")
+    function Shader(vertexPath, fragmentPath, inputLayout, numElements, vsEntry, psEntry)
+    {
+		print "vs :" + vertexPath + " ps :" + fragmentPath;
+        if (vsEntry == null) vsEntry = "VS";
+        if (psEntry == null) psEntry = "PS";
+
+        // 1. 编译顶点着色器
+        var vsBlob = _compile(vertexPath, vsEntry, "vs_5_0");
+        if (vsBlob == null) { IsSuccess = false; return; }
+
+        // 2. 编译像素着色器（fragmentPath 为空表示深度/模板阶段不需要 PS）
+        var psBlob = null;
+        if (fragmentPath != null && fragmentPath != "")
+        {
+            psBlob = _compile(fragmentPath, psEntry, "ps_5_0");
+            if (psBlob == null) { vsBlob.Release(); IsSuccess = false; return; }
+        }
+
+        // 3. 使用预先构建好的连续内存块创建输入布局
+        m_pVertexLayout = g_d3ddevice.CreateInputLayout(
+            inputLayout, numElements,
+            vsBlob.GetBufferPointer(), vsBlob.GetBufferSize());
+            print "------------------------";
+            print m_pVertexLayout;
+
+        // 4. 创建 VS / PS
+        m_pVertexShader = g_d3ddevice.CreateVertexShader(
+            vsBlob.GetBufferPointer(), vsBlob.GetBufferSize());
+		if (psBlob)
+		{
+			m_pPixelShader = g_d3ddevice.CreatePixelShader(
+				psBlob.GetBufferPointer(), psBlob.GetBufferSize());
+			psBlob.Release();
+		}
+
+        vsBlob.Release();
+    }
+
+    // ---------- 内部：从文件编译 ----------
+    // 直接复用 d3dUtil.cb 的 CreateShaderFromFile：其内部用 D3DCompileFromFile +
+    // D3D_COMPILE_STANDARD_FILE_INCLUDE 原生处理 #include，并从磁盘读取源文件，
+    // 绕开了此前“include 处理器为 null 需自行展开”以及 UTF-8 字节长度被截断的问题。
+    function _compile(path, entry, target)
+    {
+        // 不读写 .cso 缓存（csoFileName 传 null）
+        var res = CreateShaderFromFile(null, path, entry, target);
+        if (res.HResult != 0)
+        {
+            // 编译错误已由 CreateShaderFromFile 内部打印
+            return null;
+        }
+        return res.CodeBlob;
+    }
+
+    // ---------- 激活着色器 ----------
+    function use()
+    {
+        var ctx = g_d3d.m_Context;
+
+        ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx.IASetInputLayout(m_pVertexLayout);
+
+        ctx.VSSetShader(m_pVertexShader);
+        // 对齐 C++ Shader::use()：即使 PS 为空也显式调用 PSSetShader(null) 解绑上一段 PS，
+        // 否则阴影 pass 会保留普通材质 PS（其采样被置空的阴影 SRV → GPU 死锁 → Present 卡死）。
+        ctx.PSSetShader(m_pPixelShader);
+    }
+
+    function vsSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers)
+    {
+        g_d3d.m_Context.VSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
+    }
+
+    function psSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers)
+    {
+        g_d3d.m_Context.PSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
+    }
+
+    // ---------- 创建并注册常量缓冲 ----------
+    // 对应 C++：ShaderManager 在构建管线时，为 shader->m_ConstantBuffers[i] 提前创建。
+    // 缓冲所有权属于 Shader，渲染时直接取用（shader.GetConstantBuffer / GetConstantBufferPtr），
+    // 不再每帧创建。
+    //   index    : m_ConstantBuffers 槽位（0=VS, 1=PS, 2=Skinned ...）
+    //   byteWidth: 缓冲字节数（对齐 C++ sizeof 且按 16 字节对齐）
+    function CreateConstantBuffer(index, byteWidth)
+    {
+        var cbd = new D3D11_BUFFER_DESC(byteWidth, D3D11_BIND_CONSTANT_BUFFER);
+        // DEFAULT + CPUAccessFlags 0（与 Render3DCatch 一致，使用 UpdateSubresource 更新）
+        // CreateBuffer 现返回 IUnknown，作为其他接口调用（绑定 / 上传）时需取原始指针
+        var buf = g_d3d.m_Device.CreateBuffer(cbd, null);
+        m_ConstantBuffers[index] = buf;
+    }
+
+    function GetConstantBuffer(index)    { return m_ConstantBuffers[index];} 
+}

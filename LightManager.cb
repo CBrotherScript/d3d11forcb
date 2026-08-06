@@ -1,0 +1,164 @@
+// LightManager.cb —— 对应 d3dcdemo/LightManager.h / LightManager.cpp
+// 负责：阴影图槽位管理、PCF 比较采样器、把场景灯光打包进 b1 常量缓冲并绑定阴影 SRV
+import lib/windows/d3d11.cb
+import lib/glm.cb
+import define
+
+
+// PCF 采样器所需 D3D 枚举
+// 比较型滤镜 = 基础滤镜 + 0x80：MIN_MAG_LINEAR_MIP_POINT(0x14) + 0x80 = 0x94
+// （0x15 是普通 MIN_MAG_MIP_LINEAR，用于 SampleCmp 会失效恒返 0）
+const D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT = 0x94;
+const D3D11_COMPARISON_GREATER = 5;
+const D3D11_TEXTURE_ADDRESS_BORDER = 4;
+
+// CBLight 常量缓冲布局（与 commonlight.hlsli / HLSL cbuffer 紧凑打包对齐）：268 个 float = 1072 字节
+//   ambientColor   : float[4]   (0..3)
+//   viewPos        : float[3]   (4..6)  + pointLightCount : int (7)
+//   directionLightCount : int   (8)     + padding (9..11)
+//   pointLights[4] : 每元素 16 float，基址 12，步长 16
+//   directionLights[4] : 每元素 48 float，基址 76，步长 48
+const LIGHT_CB_FLOATS = 268;
+
+
+class LightManager
+{
+    var m_LightShadowMapIdx = [];   // 空闲阴影图槽位池 (1..N)
+    var m_LightBuffers      = null; // ID3D11Buffer
+    //var m_pLightBuffers     = null; // CLibPointer 包裹（供 Set/UpdateSubresource）
+    var m_SShadowPCF        = null; // PCF 比较采样器
+    var m_CBData            = null; // CLibPointer（字节寻址；set 时 Pos 需乘 4）
+
+    function LightManager()
+    {
+        // 阴影图槽位：1..maxCount（对应 C++ GlobeConfig::GetMaxLightShadowMapCount() = 4）
+        var cnt = 4;
+        for (var i = 1; i <= cnt; i++) m_LightShadowMapIdx.add(i);
+
+        // 创建 b1 光照常量缓冲
+        var cbd = new D3D11_BUFFER_DESC(LIGHT_CB_FLOATS * 4, D3D11_BIND_CONSTANT_BUFFER);
+        cbd.SetUsage(D3D11_USAGE_DEFAULT);
+        m_LightBuffers = g_d3d.m_Device.CreateBuffer(cbd, null);
+        /*m_pLightBuffers = new CLibPointer();
+        m_pLightBuffers.malloc(8);
+        m_pLightBuffers.setPointer(0, m_LightBuffers);*/
+
+        m_CBData = new CLibPointer();
+        m_CBData.malloc(LIGHT_CB_FLOATS * 4);
+
+        // PCF 比较采样器（对应 C++ LightManager::Init()）
+        var sampDesc = new D3D11_SAMPLER_DESC();
+        sampDesc.SetFilter(D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT);
+        sampDesc.SetAddressU(D3D11_TEXTURE_ADDRESS_BORDER);
+        sampDesc.SetAddressV(D3D11_TEXTURE_ADDRESS_BORDER);
+        sampDesc.SetAddressW(D3D11_TEXTURE_ADDRESS_BORDER);
+        sampDesc.SetComparisonFunc(D3D11_COMPARISON_GREATER);
+        sampDesc.SetMaxAnisotropy(1);
+        sampDesc.SetBorderColor(1.0, 1.0, 1.0, 1.0);
+        sampDesc.SetMinLOD(0.0);
+        sampDesc.SetMaxLOD(D3D11_FLOAT32_MAX);
+        m_SShadowPCF = g_d3d.m_Device.CreateSamplerState(sampDesc);
+    }
+
+    // 领取/归还阴影图槽位（对应 C++ GetFreeShadowMapIdx / AddFreeShadowMapIdx）
+    function GetFreeShadowMapIdx()
+    {
+        if (m_LightShadowMapIdx.size() <= 0) return 0;
+        var idx = m_LightShadowMapIdx.remove(0);
+        return idx;
+    }
+
+    function AddFreeShadowMapIdx(idx)
+    {
+        m_LightShadowMapIdx.add(idx);
+    }
+
+    // 把场景灯光打包进 b1 常量缓冲，并绑定阴影 SRV / PCF 采样器
+    // 对应 C++ LightManager::SetShaderLight(Shader*, View3D*)
+    function SetShaderLight(v3d)
+    {
+        var s3d = v3d.m_Scene;
+        var ctx = g_d3d.m_Context;
+
+        // 绑定灯光常量缓冲到 PS slot 1
+        ctx.PSSetConstantBuffers(1, 1, m_LightBuffers.GetAddressOf());
+
+        // ---- 打包 PsLightBuffer ----
+        // m_CBData 是 CLibPointer（字节寻址），set 时的 Pos 必须乘 4（float 索引 → 字节偏移）。
+        // ambientColor (0..3)
+        var amb = s3d.m_AmbientLight;
+        m_CBData.setFloat(0 * 4, amb[0]); m_CBData.setFloat(1 * 4, amb[1]); m_CBData.setFloat(2 * 4, amb[2]); m_CBData.setFloat(3 * 4, amb[3]);
+
+        // viewPos (4..6) + pointLightCount (7)
+        var camPos = v3d.GetCamera().Position;
+        m_CBData.setFloat(4 * 4, camPos.x()); m_CBData.setFloat(5 * 4, camPos.y()); m_CBData.setFloat(6 * 4, camPos.z());
+        // 注意：HLSL 中 pointLightCount 是 int，必须用 setInt 写整数位模式，
+        // 不能用 setFloat（写的是 1.0f 的 IEEE754 位模式，被当 int 读会变成 1065353216 → 循环爆炸 → Present 卡死）
+        m_CBData.setInt(7 * 4, s3d.m_EnablePointLightCount);
+
+        // directionLightCount (8) + padding (9..11)  —— int 字段，用 setInt
+        m_CBData.setInt(8 * 4, s3d.m_EnableDirectionLightCount);
+        // 点光源：基址 float 12，步长 16
+        for (var i = 0; i < s3d.m_PointLight.size(); i++)
+        {
+            var light = s3d.m_PointLight[i];
+            var base = 12 + i * 16;
+            var p = light.m_Point;
+            m_CBData.setFloat((base + 0) * 4, p[0]); m_CBData.setFloat((base + 1) * 4, p[1]); m_CBData.setFloat((base + 2) * 4, p[2]); m_CBData.setFloat((base + 3) * 4, p[3]);
+            var d = light.m_DiffuseColor;
+            m_CBData.setFloat((base + 4) * 4, d[0]); m_CBData.setFloat((base + 5) * 4, d[1]); m_CBData.setFloat((base + 6) * 4, d[2]); m_CBData.setFloat((base + 7) * 4, d[3]);
+            var s = light.m_SpecularColor;
+            m_CBData.setFloat((base + 8) * 4, s[0]); m_CBData.setFloat((base + 9) * 4, s[1]); m_CBData.setFloat((base + 10) * 4, s[2]); m_CBData.setFloat((base + 11) * 4, s[3]);
+            if (light.m_Attenua != 0)
+            {
+                m_CBData.setFloat((base + 12) * 4, 1.0);
+                var parm = light.GetAttenuaParm();
+                m_CBData.setFloat((base + 13) * 4, parm[0]);
+                m_CBData.setFloat((base + 14) * 4, parm[1]);
+            }
+            else
+            {
+                m_CBData.setFloat((base + 12) * 4, 0.0);
+                m_CBData.setFloat((base + 13) * 4, 0.0);
+                m_CBData.setFloat((base + 14) * 4, 0.0);
+            }
+            // base + 15 保持 CLibPointer 默认 0（padding）
+        }
+
+        // 方向光：基址 float 76，步长 48
+        for (var i = 0; i < s3d.m_DirectionLight.size(); i++)
+        {
+            var light = s3d.m_DirectionLight[i];
+            var base = 76 + i * 48;
+            var dir = light.m_Direction;
+            m_CBData.setFloat((base + 0) * 4, dir[0]); m_CBData.setFloat((base + 1) * 4, dir[1]); m_CBData.setFloat((base + 2) * 4, dir[2]); m_CBData.setFloat((base + 3) * 4, dir[3]);
+            var d = light.m_DiffuseColor;
+            m_CBData.setFloat((base + 4) * 4, d[0]); m_CBData.setFloat((base + 5) * 4, d[1]); m_CBData.setFloat((base + 6) * 4, d[2]); m_CBData.setFloat((base + 7) * 4, d[3]);
+            var s = light.m_SpecularColor;
+            m_CBData.setFloat((base + 8) * 4, s[0]); m_CBData.setFloat((base + 9) * 4, s[1]); m_CBData.setFloat((base + 10) * 4, s[2]); m_CBData.setFloat((base + 11) * 4, s[3]);
+            // lightProjection mat4（列主序直传，无需像 C++ 那样对 XM 转置）
+            var proj = light.m_LightProjection.array();
+            for (var k = 0; k < 16; k++) m_CBData.setFloat((base + 12 + k) * 4, proj[k]);
+            // lightView mat4
+            var view = light.m_LightView.array();
+            for (var k = 0; k < 16; k++) m_CBData.setFloat((base + 28 + k) * 4, view[k]);
+            // castShadows (44)  —— int 字段，用 setInt（对齐 C++ memcpy int 成员）
+            m_CBData.setInt((base + 44) * 4, light.m_CastShadows);
+            // base + 45..47 padding
+
+            // 绑定阴影深度图 SRV 到对应槽位 (t4..t7)
+            if (light.m_CastShadows > 0 && light.m_DepthMapResourceView != null)
+            {
+                ctx.PSSetShaderResources(4 + light.m_CastShadows, 1, light.m_DepthMapResourceView.GetAddressOf());
+            }
+        }
+
+        // PCF 比较采样器绑定到 slot 5
+        ctx.PSSetSamplers(5, 1, m_SShadowPCF.GetAddressOf());
+
+        //print " ----------------------------------------112222222111111" ;
+        // 上传常量缓冲（UpdateSubresource 第一参需裸缓冲对象，非 CLibPointer）
+        ctx.UpdateSubresource(m_LightBuffers, 0, null, m_CBData, 0, 0);
+        //print " ----------------------------------------112222222" ;
+    }
+}

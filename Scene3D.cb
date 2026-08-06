@@ -1,0 +1,249 @@
+import Scene.cb
+import view3d.cb            // View3D, DRAW_TYPE_NORMAL / DRAW_TYPE_GBUFFER / DRAW_TYPE_SKYBOX
+import Render3DCatch.cb     // get()：全局 UBO 与渲染状态
+import ShaderManager.cb     // getShaderManager(), SHADER_TYPE_2D
+import Light.cb             // Light / AmbientLight / PointLight / DirectionLight
+import LightManager.cb      // g_lightManager：灯光常量缓冲与阴影管理
+
+// =============================================================================
+// Scene3D.cb — 仿 d3dcdemo/Scene3D.h + .cpp 的 CBrother 版本
+//
+//   * 继承 Scene（public Scene），复用基类的子节点遍历（Darw 分发）。
+//   * 灯光管理已接入：AddLight 按类型分流；Darw 内含阴影 pass 与
+//     LightManager::SetShaderLight 上传光照常量缓冲（b1）+ 绑定阴影 SRV / PCF 采样器。
+//   * 延迟渲染（GBuffer 多渲染目标 + 全屏 quad 延迟光照合成）已实现，与 C++ Scene3D.cpp 的 DEFERED_SHADING_ENABLE 分支一致。
+// =============================================================================
+
+class Scene3D extends Scene
+{
+    // ===== 灯光相关（预留，不实现）=====
+    var m_AmbientLight              = null;   // 环境光颜色
+    var m_PointLight                = [];                     // 点光源列表
+    var m_EnablePointLightCount = 0;                      // 启用的方向光数量
+    var m_DirectionLight            = [];                     // 方向光列表
+    var m_EnableDirectionLightCount   = 0;                      // 启用阴影的光源数量
+
+    // ===== FBO / HDR 相关（预留，不实现）=====
+    var m_HdrFBO         = null;   // 离屏帧缓冲（HDR 延迟渲染用）
+    var m_HdrRboDepth    = null;   // 深度渲染缓冲
+    var m_HdrColorBuffer = [];     // 多张颜色缓冲（GBuffer / 光照结果）
+
+    function Scene3D()
+    {
+        super();
+    }
+
+    // 按灯光实际类型向 m_PointLight / m_DirectionLight 分发（对应 C++ Scene3D::AddLight）
+    function AddLight(light)
+    {
+        if (light == null) return;
+        if (light.m_Type == LIGHT_TYPE_AMBIENT)
+        {
+            m_AmbientLight = light.m_AmbientColor;
+        }
+        else if (light.m_Type == LIGHT_TYPE_POINTER)
+        {
+            m_PointLight.add(light);
+            m_EnablePointLightCount = m_PointLight.size();
+        }
+        else if (light.m_Type == LIGHT_TYPE_DIRECTION)
+        {
+            m_DirectionLight.add(light);
+            m_EnableDirectionLightCount = m_DirectionLight.size();
+        }
+    }
+
+    // 预留下：射线-包围盒拾取，返回命中精灵
+    function Pick(v, cameraPos, mousePos)
+    {
+        // TODO: 由 cameraPos + mousePos 生成射线，与子节点包围盒求交，返回命中精灵。
+        return null;
+    }
+
+    var m_NullArr = null;
+    // 对应 C++ Scene3D::Darw(View* v, DRAW_TYPE t)
+    virtual function Darw(v, t)
+    {        
+        //print "aaaaaaaaaaaaaaaaaaaa--------------------------";
+        // 1. 正面剔除（对应 C++ Render3DCatch::get()->CullFace(true)）
+        g_render3DCatch.CullFace(true);
+        for (var i = 0; i < m_EnablePointLightCount; i++)
+        {
+            m_PointLight[i].UpdateTransform();
+        }
+
+        // 2. 阴影 pass：遍历方向光，将几何深度渲染进各自阴影图
+        //    （对应 C++ Scene3D::Darw 阴影循环：UpdateTransform + BindDepthMap + super.Darw + UnbindDepthMap）
+        for (var i = 0; i < m_DirectionLight.size(); i++)
+        {
+            
+            var dl = m_DirectionLight[i];
+            dl.UpdateTransform();
+
+            if (dl.m_CastShadows > 0)
+            {
+                
+                g_render3DCatch.UpdateGlobalUBO_Light(dl);  // 全局 UBO 切到光源视锥
+               
+                dl.BindDepthMap();                          // 绑定阴影深度图 + 阴影视口
+                
+                super.Darw(v, DRAW_TYPE_DEPTH);             // 阴影 pass 用深度专用 shader（无 PS，只写深度）
+              
+                dl.UnbindDepthMap();                        // 恢复主 RT
+            }
+        }
+        
+        _setMainViewport(v);   // 阴影 pass 改过视口，主 pass 前还原
+        // 3. 更新全局相机 UBO（对应 C++ UpdateGlobalUBO((View3D*)v)）
+        g_render3DCatch.UpdateGlobalUBO_View(v);
+        // 4. 上传灯光常量缓冲（b1）+ 绑定阴影 SRV / PCF 采样器（对应 C++ SetShaderLight）
+        
+
+        var bufferPos = 0;
+	    var colorBufferPos = bufferPos++;
+        if (DEFERED_SHADING_ENABLE)
+        {
+            // ===== 延迟渲染（GBuffer + 延迟光照合成 → 离屏 RT，最终由下方共用 2D 合成上屏）=====
+            // 对齐 C++ Scene3D::Darw 的 DEFERED_SHADING_ENABLE 分支（157-183 行）
+
+            // 1. 绑定 GBuffer 多渲染目标（内含 ClearGBuffer：清 4 张 GBuffer RT + depth）
+            v.BindGBuffer();
+
+            // 2. GBuffer pass：几何写入 4 个 MRT（位置/法线/漫反射/高光）
+            super.Darw(v, DRAW_TYPE_GBUFFER);
+
+            v.UnbindGBuffer();
+
+            // 3. 切到离屏 RT：延迟光照合成与天空盒都写入离屏纹理，最终由下方共用 2D 合成上屏
+            //    对应 C++：BindOffscreenBuffer(colorBufferPos) + Scene::Darw(SKYBOX) + DEFERRED 合成
+            v.BindOffscreenBuffer(colorBufferPos);
+
+            // 3.1 天空盒先画到离屏（背景）
+            super.Darw(v, DRAW_TYPE_SKYBOX);
+
+            // 3.2 延迟光照合成：全屏 quad 采样 4 张 GBuffer SRV，写入离屏 RT
+            var deferredShader = g_shaderManager.GetShader(SHADER_TYPE_DEFERRED);
+            deferredShader.use();
+            // 绑定灯光常量缓冲（b1）+ 阴影 SRV / PCF 采样器（对应 C++ SetShaderLight(SHADER_TYPE_DEFERRED, v)）
+            g_lightManager.SetShaderLight(v);
+            // 4 张 GBuffer SRV 绑到像素着色器 t0-t3（对应 C++ PSSetShaderResources(0, 4, m_GBufferSRVs)）
+            // 复用 View3D 的 m_GBufferSRVArr（pointer 类型数组，CLibArray("pointer",4)，平台字长自适应）
+            g_d3d.m_Context.PSSetShaderResources(0, 4, v.m_GBufferSRVArr.addr());
+            // 绘制全屏四边形（延迟光照结果写入离屏 RT）；对应 C++ Render3DCatch::get()->renderQuad()
+            g_render3DCatch.CullFace(false);
+            renderQuad();
+
+            // 4. 切回主 RT，延迟结果已落在离屏纹理 m_OffscreenColorResourceView[colorBufferPos]
+            v.UnbindOffscreenBuffer(colorBufferPos);            
+
+            // 3.3 解绑 GBuffer SRV（对应 C++ 置空 PSSetShaderResources）
+            if (m_NullArr == null)
+            {
+                m_NullArr = new CLibArrayData(new CLibArray("pointer", 4));
+                m_NullArr.setPointer(0, 0); 
+                m_NullArr.setPointer(1, 0); 
+                m_NullArr.setPointer(2, 0); 
+                m_NullArr.setPointer(3, 0);                
+            }
+
+            g_d3d.m_Context.PSSetShaderResources(0, 4, m_NullArr.addr());
+        }
+        else
+        {
+             
+            g_lightManager.SetShaderLight(v);
+            
+
+            v.BindOffscreenBuffer(colorBufferPos);          
+            //g_render3DCatch.UpdateGlobalUBO_Light(m_DirectionLight[2]);  // 全局 UBO 切到光源视锥
+            // ===== 正向渲染（带光照 + 阴影）=====
+            super.Darw(v, DRAW_TYPE_NORMAL);     // 遍历子节点绘制 
+            v.UnbindOffscreenBuffer(colorBufferPos);
+        }
+
+        g_shaderManager.GetShader(SHADER_TYPE_2D).use();
+        g_render3DCatch.CullFace(false);     // 关闭剔除，绘制全屏四边形
+        g_d3d.m_Context.PSSetShaderResources(0, 1, v.m_OffscreenColorResourceView[colorBufferPos].GetAddressOf());
+        renderQuad();
+        //g_d3d.m_Context.PSSetShaderResources(0, 0, null);
+    }
+
+    // 还原主视口（阴影 pass 改过视口，这里恢复成视图矩形大小）
+    function _setMainViewport(v)
+    {
+        var ctx = g_d3d.m_Context;
+        var vp = new D3D11_VIEWPORT();
+        vp.SetTopLeftX(v.m_Rect.bx * 1.0);
+        vp.SetTopLeftY(v.m_Rect.by * 1.0);
+        vp.SetWidth(v.m_Rect.width * 1.0);
+        vp.SetHeight(v.m_Rect.height * 1.0);
+        vp.SetMinDepth(0.0);
+        vp.SetMaxDepth(1.0);
+        ctx.RSSetViewports(vp);
+    }
+}
+
+// =============================================================================
+// 全屏四边形（对应 C++ renderQuad）
+//   创建一次静态顶点/索引缓冲与采样器，之后每次 Darw 直接绘制。
+//   顶点按 SHADER_TYPE_2D 的 m_pStdLayout 布局：pos(3)+uv(2)+normal(3)+tangent(3)+bitangent(3)
+//   = 56 字节/顶点，确保输入装配器不会越界读取。
+// =============================================================================
+
+var g_QuadVB      = null;
+var g_QuadIB      = null;
+var g_QuadSampler = null;
+
+var g_QuadVBStride = new D3D11_INT_ARRAY(1);
+var g_QuadVBOffset = new D3D11_INT_ARRAY(1);
+
+function _initQuadGeometry()
+{
+    // pos(3) + uv(2) + normal(3) + tangent(3) + bitangent(3)
+    var verts = [
+        -1, -1, 0,   0, 1,   0,0,0,   0,0,0,   0,0,0,
+        -1,  1, 0,   0, 0,   0,0,0,   0,0,0,   0,0,0,
+         1,  1, 0,   1, 0,   0,0,0,   0,0,0,   0,0,0,
+         1, -1, 0,   1, 1,   0,0,0,   0,0,0,   0,0,0
+    ];
+    var vbuf = new CLibPointer(); vbuf.malloc(verts.size() * 4);
+    for (var i = 0; i < verts.size(); i++) vbuf.setFloat(i * 4, verts[i]);
+
+    var vdesc = new D3D11_BUFFER_DESC(verts.size() * 4, D3D11_BIND_VERTEX_BUFFER);
+    vdesc.SetUsage(D3D11_USAGE_IMMUTABLE);
+    var vdata = new D3D11_SUBRESOURCE_DATA(); vdata.SetSysMem(vbuf);
+    g_QuadVB = g_d3ddevice.CreateBuffer(vdesc, vdata);
+    g_QuadVBStride.Set(0, 56);
+    g_QuadVBOffset.Set(0, 0);    
+
+    var indices = [0, 1, 2, 2, 3, 0];
+    var ibuf = new CLibPointer(); ibuf.malloc(indices.size() * 4);
+    for (var i = 0; i < indices.size(); i++) ibuf.setInt(i * 4, indices[i]);
+
+    var idesc = new D3D11_BUFFER_DESC(indices.size() * 4, D3D11_BIND_INDEX_BUFFER);
+    idesc.SetUsage(D3D11_USAGE_IMMUTABLE);
+    var idata = new D3D11_SUBRESOURCE_DATA(); idata.SetSysMem(ibuf);
+    g_QuadIB = g_d3ddevice.CreateBuffer(idesc, idata);
+
+    var sdesc = new D3D11_SAMPLER_DESC();
+    sdesc.SetFilter(D3D11_FILTER_MIN_MAG_MIP_LINEAR);
+    sdesc.SetAddressU(D3D11_TEXTURE_ADDRESS_WRAP);
+    sdesc.SetAddressV(D3D11_TEXTURE_ADDRESS_WRAP);
+    sdesc.SetAddressW(D3D11_TEXTURE_ADDRESS_WRAP);
+    sdesc.SetComparisonFunc(D3D11_COMPARISON_NEVER);
+    sdesc.SetMinLOD(0);
+    sdesc.SetMaxLOD(D3D11_FLOAT32_MAX);
+    g_QuadSampler = g_d3ddevice.CreateSamplerState(sdesc);
+}
+
+function renderQuad()
+{
+    if (g_QuadVB == null) _initQuadGeometry();
+
+    var ctx = g_d3d.m_Context;
+    ctx.PSSetSamplers(0, 1, g_QuadSampler.GetAddressOf());
+
+    ctx.IASetVertexBuffers(0, 1,g_QuadVB.GetAddressOf(), g_QuadVBStride, g_QuadVBOffset);
+    ctx.IASetIndexBuffer(g_QuadIB, DXGI_FORMAT_R32_UINT, 0);
+    ctx.DrawIndexed(6, 0, 0);
+}

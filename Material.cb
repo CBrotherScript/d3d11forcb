@@ -1,0 +1,159 @@
+// ============================================================================
+// Material.cb —— 材质（架构参照 d3dcdemo 的 Material.h）
+//
+//   Material        : 抽象基类，保存 m_Shader / m_DepthMapShader / 类型，提供接口
+//   NormalMaterial  : 普通材质（color / emissive / metallic / roughness / ao），
+//                     并负责把自身的 Shader、贴图、常量缓冲绑定到渲染管线
+//
+//   贴图用 key 字符串引用（对应 C++ 的 textureKey），运行时由 TextureManager 解析。
+//   （CBrother 端 TextureManager 已就绪，Draw 里通过 key 取 Texture 再 Bind）
+//
+//   常量缓冲（CB）：模型矩阵 + 相机矩阵由调用方（View3D）在 Draw 外设置（预留接口
+//   SetVSConstantBuffer / SetPSConstantBuffer），此处只负责“材质”相关的资源绑定。
+// ============================================================================
+
+import Shader.cb
+import ShaderManager.cb
+import TextureManager.cb
+import define.cb
+
+// ---------- 材质类型（与 C++ MaterialType 枚举对齐）----------
+const MATERIAL_NORMAL       = 0;   // 普通材质
+const MATERIAL_CUSTOM       = 1;   // 自定义材质
+const MATERIAL_POST_PROCESS = 2;   // 后处理材质
+const MATERIAL_MAX          = 3;   // 数量上限（数组边界）
+    
+class Material
+{
+    var m_Shader = null;          // Shader 对象（普通渲染用，对应 m_pShader）
+    var m_DepthMapShader = null;  // 阴影/深度 pass 用（对应 m_pDepthMapShader）
+    var m_Type = MATERIAL_NORMAL;
+
+    function Material() { }
+
+    function GetShader()        { return m_Shader; }
+    function GetDepthMapShader(){ return m_DepthMapShader; }
+    function GetMaterialType()  { return m_Type; }
+
+    // 复制（对应 C++ Material::Copy 抽象方法）
+    function Copy() { return new Material(); }
+
+    // 把材质相关资源（shader + 贴图 + 采样器）绑定到上下文。
+    // depthMode=true 时使用 m_DepthMapShader 而非 m_Shader。
+    function Bind(depthMode)
+    {
+        if (depthMode && m_DepthMapShader != null)
+        {
+            m_DepthMapShader.use();
+        }
+        else if (m_Shader != null)
+        {
+            m_Shader.use();
+        }
+    }
+
+    // 销毁（此处无独立所有权，shader 由 ShaderManager 单例持有）
+    function Dispose() { }
+}
+
+// ---------- 普通材质 ----------
+class NormalMaterial extends Material
+{
+    // 与 C++ XMFLOAT4 m_Color 等同，这里用 vec4 表示 rgba
+    var m_Color = glm::vec4(1, 1, 1, 1);
+    var m_Emissive = glm::vec4(0, 0, 0, 0);
+    var m_Metallic = 0.0;
+    var m_Roughness = 0.0;
+    var m_AO = 0.0;
+    var m_SpecularStrength = 1.0;   // 高光强度（对应 C++ m_SpecularStrength，默认 1.0）
+    var m_ShininessStrength = 32.0; // 光泽度（对应 C++ m_ShininessStrength，默认 32.0）
+
+    // 贴图直接存储 Texture 对象（对应 C++ 的 Texture*），初始化时赋值，渲染时直接取用，
+    // 避免每帧按 key 查找 TextureManager。
+    var m_AlbedoTexture    = null;   // 漫反射 / 基础色
+    var m_SpecularTexture  = null;   // 高光
+    var m_NormalTexture    = null;   // 法线
+    // 以下为占位（当前 PS 未使用），保留 key 形式
+    var m_MetallicTexturKey  = "";
+    var m_RoughnessTexturKey = "";
+    var m_AOTexturKey        = "";
+
+    // 采样器状态（对应 C++ sampler state），由 Draw 时统一绑定
+    var m_pSampler = null;
+
+    function NormalMaterial()
+    {
+        super();
+        m_Type = MATERIAL_NORMAL;
+        // 默认 shader 从 ShaderManager 单例取
+        m_Shader = g_shaderManager.GetShader(SHADER_TYPE_3D_NORMAL);
+        // 深度 pass 用 DEPTH shader（无 PS，仅 VS 写深度）
+        m_DepthMapShader = g_shaderManager.GetShader(SHADER_TYPE_DEPTH);
+    }
+
+    function SetColor(r, g, b, a)
+    {
+        m_Color = new vec4(r, g, b, a);
+    }
+
+    function GetColor() { return m_Color; }
+
+    function SetSpecularStrength(s) { m_SpecularStrength = s; }
+    function GetSpecularStrength()  { return m_SpecularStrength; }
+    function SetShininessStrength(s) { m_ShininessStrength = s; }
+    function GetShininessStrength()  { return m_ShininessStrength; }
+
+    function SetAlbedoTexture(tex)   { m_AlbedoTexture   = tex; }   // 直接存 Texture 对象
+    function SetSpecularTexture(tex) { m_SpecularTexture = tex; }
+    function SetNormalTexture(tex)   { m_NormalTexture   = tex; }
+    function GetAlbedoTexture()   { return m_AlbedoTexture; }
+    function GetSpecularTexture() { return m_SpecularTexture; }
+    function GetNormalTexture()   { return m_NormalTexture; }
+
+    // 便捷：按 key 在初始化时一次性解析为 Texture 对象并存入（渲染时不再查 key）
+    function SetAlbedoTexturKey(key)   { m_AlbedoTexture   = g_textureManager.GetTexture(key); }
+    function SetSpecularTexturKey(key) { m_SpecularTexture = g_textureManager.GetTexture(key); }
+    function SetNormalTexturKey(key)   { m_NormalTexture  = g_textureManager.GetTexture(key); }
+
+    // 复制（深拷贝关键字段，贴图仅复制 key）
+    function Copy()
+    {
+        var m = new NormalMaterial();
+        m.m_Color    = m_Color.copy();
+        m.m_Emissive = m_Emissive.copy();
+        m.m_Metallic = m_Metallic;
+        m.m_Roughness = m_Roughness;
+        m.m_AO       = m_AO;
+        m.m_AlbedoTexture   = m_AlbedoTexture;
+        m.m_SpecularTexture = m_SpecularTexture;
+        m.m_NormalTexture   = m_NormalTexture;
+        m.m_MetallicTexturKey = m_MetallicTexturKey;
+        m.m_RoughnessTexturKey = m_RoughnessTexturKey;
+        m.m_AOTexturKey       = m_AOTexturKey;
+        m.m_pSampler       = m_pSampler;
+        return m;
+    }
+
+    // 把材质相关资源绑定到上下文（shader + 贴图 + 采样器）
+    // slot 起始采样器/贴图槽位；context 为 ID3D11DeviceContext
+    function BindMaterial(context, slot, depthMode)
+    {
+        Bind(depthMode);
+
+        if (m_Shader == null && m_DepthMapShader == null) return;
+
+        // 直接绑定基础色贴图（slot 0），不再按 key 解析
+        if (m_AlbedoMap != null)
+            m_AlbedoMap.Bind(slot, context);
+        // 其他贴图按需绑定到后续槽位（预留）：
+        // if (m_NormalMap != null) m_NormalMap.Bind(slot+1, context);
+
+        // 绑定采样器状态（存在的话）
+        if (m_pSampler != null)
+        {
+            context.PSSetSamplers(slot, 1, m_pSampler.GetAddressOf());
+        }
+    }
+
+    function Dispose() { }
+}

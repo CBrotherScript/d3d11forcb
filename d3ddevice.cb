@@ -1,0 +1,243 @@
+import lib/windows/d3d11
+import CBCLib.code
+
+// =============================================================================
+// D3DDevice: 仅负责设备/交换链/渲染目标/深度/光栅状态 与 渲染循环驱动
+// =============================================================================
+class D3DDevice
+{
+	var m_Device  = null;
+	var m_Context = null;
+	var m_Swap    = null;
+	var m_Rtv     = null;
+	var m_Dsv     = null;          // 深度模板视图
+	var m_ClearColor = null;
+	var m_DepthStencil = null;     // 深度模板状态
+	var m_Running  = false;
+
+	var m_Width = 0;
+	var m_Height = 0;
+
+	var m_FrameCount = 0;          // 帧率统计：累计帧数
+	var m_FpsTimer   = 0.0;        // 帧率统计：累计时间(秒)
+	var m_LastTick   = 0;          // 帧率统计：上一帧时间戳(毫秒)
+
+	function D3DDevice() {}
+
+	function Init(hwnd, width, height)
+	{
+		print("create CBrotherD3D11. width: " + width + ", height: " + height);
+		m_Width = width;
+		m_Height = height;
+
+		var desc = new DXGI_SWAP_CHAIN_DESC();
+		desc.SetWidth(width);
+		desc.SetHeight(height);
+		desc.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+		desc.SetBufferUsage(DXGI_USAGE_RENDER_TARGET_OUTPUT);
+		desc.SetOutputWindow(hwnd);
+		// 业务默认初始化（原在 DXGI_SWAP_CHAIN_DESC 构造器中）
+		desc.SetRefreshRateNumerator(60);   // sd.BufferDesc.RefreshRate.Numerator = 60
+		desc.SetRefreshRateDenominator(1);  // sd.BufferDesc.RefreshRate.Denominator = 1
+		desc.SetSampleCount(1);             // SampleDesc.Count = 1
+		desc.SetBufferCount(2);             // BufferCount = 2 (三重缓冲)
+		desc.SetWindowed(1);               // Windowed = TRUE
+
+		var result = CreateDeviceAndSwapChain(desc);
+		m_Device  = result.Device;
+		m_Context = result.Context;
+		m_Swap    = result.SwapChain;
+
+		if (result.Succeeded)
+		{
+			createRenderTargetView();
+		}
+        g_d3ddevice = m_Device;        
+        g_d3dcontext = m_Context;
+
+        g_render3DCatch = new Render3DCatch();
+        g_shaderManager = new ShaderManager();
+        g_textureManager = new TextureManager();
+        g_materialManager = new MaterialManager();
+		g_lightManager = new LightManager();
+	}
+
+	function createRenderTargetView()
+	{
+		var pBackBuffer = m_Swap.GetBuffer(0, IID_Texture2D);
+		if (pBackBuffer == null)
+		{
+			print "GetBuffer failed";
+			return;
+		}
+		
+		m_Rtv = m_Device.CreateRenderTargetView(pBackBuffer, null);
+		if (m_Rtv == null)
+		{
+			print "CreateRenderTargetView failed";
+			return;
+		}
+
+		m_ClearColor = new D3D11_Float4(0.0, 0.0, 0.0, 1.0);
+		//m_ClearColor.Set(0.1, 0.0, 0.0, 1.0);   // 暗红背景，便于区分“清屏成功”与“失败黑屏”
+
+		// 视口（必须与后台缓冲大小一致；D3D11 默认视口为 0 尺寸，必须显式设置）
+		var vp = new D3D11_VIEWPORT();
+		vp.SetTopLeftX(0.0);    // TopLeftX
+		vp.SetTopLeftY(0.0);    // TopLeftY
+		vp.SetWidth(m_Width);     // Width  (匹配 SwapChainDesc)
+		vp.SetHeight(m_Height);    // Height (匹配 SwapChainDesc)
+		vp.SetMinDepth(0.0);    // MinDepth
+		vp.SetMaxDepth(1.0);    // MaxDepth
+		m_Context.RSSetViewports(vp);
+
+		// 深度模板纹理 + 视图（3D 正确遮挡需要；格式 D24S8，绑定 DEPTH_STENCIL）
+		var dsDesc = new D3D11_TEXTURE2D_DESC();
+		dsDesc.SetWidth(m_Width);
+		dsDesc.SetHeight(m_Height);
+		dsDesc.SetMipLevels(1);
+		dsDesc.SetArraySize(1);
+		dsDesc.SetFormat(DXGI_FORMAT_D24_UNORM_S8_UINT);
+		dsDesc.SetSampleCount(1);
+		dsDesc.SetSampleQuality(0);
+		dsDesc.SetUsage(D3D11_USAGE_DEFAULT);
+		dsDesc.SetBindFlags(D3D11_BIND_DEPTH_STENCIL);
+		dsDesc.SetCPUAccessFlags(0);
+		dsDesc.SetMiscFlags(0);
+
+		var dsTex = m_Device.CreateTexture2D(dsDesc, null);
+		if (dsTex != null)
+		{
+			m_Dsv = m_Device.CreateDepthStencilView(dsTex, null);
+			dsTex.Release();   // CreateDepthStencilView 内部 AddRef，释放这份多余引用
+		}
+		else
+		{
+			print "CreateTexture2D(depth) failed";
+		}
+
+		// 深度模板状态：开启深度测试，新像素深度小于深度缓冲值时写入
+		var dsStateDesc = new D3D11_DEPTH_STENCIL_DESC();
+		dsStateDesc.SetDepthEnable(1);
+		dsStateDesc.SetDepthWriteMask(D3D11_DEPTH_WRITE_MASK_ALL);
+		dsStateDesc.SetDepthFunc(D3D11_COMPARISON_LESS);
+		dsStateDesc.SetStencilEnable(0);
+		dsStateDesc.SetStencilMasks(0xFF, 0xFF);
+		dsStateDesc.SetFrontFace(1, 1, 1, 8);   // KEEP, KEEP, KEEP, ALWAYS
+		dsStateDesc.SetBackFace(1, 1, 1, 8);
+		m_DepthStencil = m_Device.CreateDepthStencilState(dsStateDesc);
+		if (m_DepthStencil == null)
+			print "CreateDepthStencilState failed";
+
+		// GetBuffer 返回 ID3D11Texture2D，CreateRenderTargetView 会内部 AddRef 一份引用，
+		// 此处 Release 掉 GetBuffer 持有的这份多余引用，与 C 参考实现一致
+		pBackBuffer.Release();
+	}
+
+	// ===== 窗口尺寸变化：重建后台缓冲 RTV、深度缓冲 DSV 与视口 =====
+	function resizeSwapChain(width, height)
+	{
+		if (m_Swap == null || m_Device == null || m_Context == null) return;
+		if (width <= 0 || height <= 0) return;   // 最小化等情况跳过
+
+		m_Width = width;
+		m_Height = height;
+
+		// 必须先释放对后台缓冲的引用（RTV/DSV），ResizeBuffers 才能成功；
+		// m_Rtv/m_Dsv 已是 IUnknown 对象，直接调其 Release 即可
+		if (m_Rtv != null)
+		{
+			m_Rtv.Release();
+			m_Rtv = null;
+		}
+		if (m_Dsv != null)
+		{
+			m_Dsv.Release();
+			m_Dsv = null;
+		}
+
+		// 重建交换链后台缓冲（newFormat=0 表示沿用原格式）
+		var hr = m_Swap.ResizeBuffers(2, width, height, 0, 0);
+		if (hr != 0) { print "ResizeBuffers failed hr = " + hr; return; }
+
+		// 重建主 RTV
+		var pBackBuffer = m_Swap.GetBuffer(0, IID_Texture2D);
+		if (pBackBuffer == null) { print "GetBuffer failed in resize"; return; }
+		m_Rtv = m_Device.CreateRenderTargetView(pBackBuffer, null);
+		pBackBuffer.Release();
+		if (m_Rtv == null) { print "CreateRenderTargetView failed in resize"; return; }
+
+		// 重建深度缓冲（DSV）
+		var dsDesc = new D3D11_TEXTURE2D_DESC();
+		dsDesc.SetWidth(width);
+		dsDesc.SetHeight(height);
+		dsDesc.SetMipLevels(1);
+		dsDesc.SetArraySize(1);
+		dsDesc.SetFormat(DXGI_FORMAT_D24_UNORM_S8_UINT);
+		dsDesc.SetSampleCount(1);
+		dsDesc.SetSampleQuality(0);
+		dsDesc.SetUsage(D3D11_USAGE_DEFAULT);
+		dsDesc.SetBindFlags(D3D11_BIND_DEPTH_STENCIL);
+		dsDesc.SetCPUAccessFlags(0);
+		dsDesc.SetMiscFlags(0);
+		var dsTex = m_Device.CreateTexture2D(dsDesc, null);
+		if (dsTex != null)
+		{
+			m_Dsv = m_Device.CreateDepthStencilView(dsTex, null);
+			dsTex.Release();
+		}
+		else
+		{
+			print "CreateTexture2D(depth) failed in resize";
+		}
+
+		// 更新视口到新尺寸
+		var vp = new D3D11_VIEWPORT();
+		vp.SetTopLeftX(0.0);
+		vp.SetTopLeftY(0.0);
+		vp.SetWidth(width * 1.0);
+		vp.SetHeight(height * 1.0);
+		vp.SetMinDepth(0.0);
+		vp.SetMaxDepth(1.0);
+		m_Context.RSSetViewports(vp);
+	}
+
+	function renderFrame()
+	{
+		if (m_Rtv == null || m_Context == null || m_Swap == null) return;
+
+		// 清屏 + 清深度
+		m_Context.OMSetRenderTargets(1,m_Rtv.GetAddressOf(), m_Dsv);
+		m_Context.ClearRenderTargetView(m_Rtv, m_ClearColor);
+		if (m_Dsv != null)
+			m_Context.ClearDepthStencilView(m_Dsv, D3D11_CLEAR_DEPTH_STENCIL, 1.0, 0);
+		if (m_DepthStencil != null)
+			m_Context.OMSetDepthStencilState(m_DepthStencil, 0);
+
+        var t0 = mtime();
+        g_view3d.Darw();
+        var t1 = mtime();
+		m_Swap.Present(1, 0);
+        var t2 = mtime();
+        //print "renderFrame: draw=" + (t1 - t0) + "ms, present=" + (t2 - t1) + "ms";
+		// ===== 帧率统计：每 5 秒打印一次平均 FPS =====
+		var nowTick = mtime();   // 毫秒级时间戳（CBrother 内置函数）
+		if (m_LastTick != 0)
+		{
+			var dt = (nowTick - m_LastTick) / 1000.0;   // 本帧耗时(秒)
+			if (dt > 0)
+			{
+				m_FrameCount = m_FrameCount + 1;
+				m_FpsTimer = m_FpsTimer + dt;
+			}
+		}
+		m_LastTick = nowTick;
+		if (m_FpsTimer >= 5.0)
+		{
+			var fps = m_FrameCount / m_FpsTimer;
+			print("[FPS] " + fps + "  (" + m_FrameCount + " frames / " + m_FpsTimer + "s)");
+			m_FrameCount = 0;
+			m_FpsTimer = 0.0;
+		}	
+	}
+}

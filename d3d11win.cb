@@ -1,0 +1,212 @@
+﻿import lib/windows/CustomWindow
+import CBCLib.code
+import lib/windows/d3d11
+import lib/math
+import camera
+import texture
+import d3ddevice
+import define
+import TextureManager
+import view3d
+import MaterialManager
+import cube
+import plane
+import Scene3D
+import SkyBox
+
+class D3D11Win extends CustomWindow
+{
+	// 记录上一次窗口尺寸，避免 WM_SIZE 拖拽时频繁触发重建
+	var m_LastWndW = 800;
+	var m_LastWndH = 600;
+
+	function D3D11Win(params)
+	{
+		super("d3d11win");
+		setBackground(COLOR_WINDOW);
+		createWindow("d3d11win",WS_OVERLAPPEDWINDOW,100,100,900,700,null);
+	}
+
+	function onCreate()
+	{
+		var rect = getClientRect();
+		var width = rect.right - rect.left;
+		var height = rect.bottom - rect.top;
+		m_LastWndW = width;
+		m_LastWndH = height;
+
+		g_d3d.Init(m_hWnd,width,height);
+		
+		var tex = new Texture(GetRoot() + "res/container2.png");
+		g_textureManager.AddTexture("container2.png",tex);
+		tex = new Texture(GetRoot() + "res/container2_specular.png");
+		g_textureManager.AddTexture("container2_specular.png",tex);
+		tex = new Texture(GetRoot() + "res/brickwall.jpg");
+		g_textureManager.AddTexture("brickwall.jpg",tex);
+		tex = new Texture(GetRoot() + "res/metal.png");
+		g_textureManager.AddTexture("metal.png",tex);
+
+		// 顺序必须匹配 D3D 立方体贴图下标约定：0:+X,1:-X,2:+Y,3:-Y,4:+Z,5:-Z
+		// 即 right,left,top,bottom,front,back（与 C++ d3d11test.cpp 顺序一致）
+		var vec = [];
+		vec.add(GetRoot() + "./res/skybox/right.jpg");   // +X
+		vec.add(GetRoot() + "./res/skybox/left.jpg");    // -X
+		vec.add(GetRoot() + "./res/skybox/top.jpg");     // +Y
+		vec.add(GetRoot() + "./res/skybox/bottom.jpg");  // -Y
+		vec.add(GetRoot() + "./res/skybox/front.jpg");   // +Z
+		vec.add(GetRoot() + "./res/skybox/back.jpg");    // -Z
+		var skyboxtexture = new Texture();
+		skyboxtexture.LoadTextureCube(vec);
+		g_textureManager.AddTexture("skybox", skyboxtexture);
+		
+		var cubeMaterial = g_materialManager.CreateNormalMaterial();
+		cubeMaterial.SetAlbedoTexturKey("container2.png");
+		cubeMaterial.SetSpecularTexturKey("container2_specular.png");
+
+		var cubeMaterial2 = g_materialManager.CreateNormalMaterial();
+		cubeMaterial2.SetAlbedoTexturKey("brickwall.jpg");
+
+		var planeMaterial = g_materialManager.CreateNormalMaterial();
+		planeMaterial.SetAlbedoTexturKey("metal.png");
+
+		var skyboxMaterial = g_materialManager.CreateNormalMaterial();
+		skyboxMaterial.SetAlbedoTexturKey("skybox");
+
+		g_view3d = new View3D(new DarwRect(0,0,width,height));
+		g_view3d.SetCameraPostion(glm::vec3(0,2,10));
+		g_view3d.SetViewRect(new DarwRect(0,0,width,height));
+
+		var s3d = new Scene3D();
+		g_view3d.SetScene(s3d);
+		
+		var ambientLight = new AmbientLight();
+		ambientLight.SetAmbientColor(255 * 0.1, 255 * 0.1, 255 * 0.1);
+		//ambientLight.SetAmbientColor(255, 255, 255);
+		s3d.AddLight(ambientLight);
+
+		var pointLight2 = new PointLight(255, 255, 255);
+		pointLight2.SetPosition(glm::vec3(-6, 6, 6));
+		pointLight2.SetAttenuation(PLA_100);
+		s3d.AddLight(pointLight2);
+
+		var directionLight = new DirectionLight(255, 255, 255);
+		directionLight.SetPosition(glm::vec3(-50, 50, 50));
+		directionLight.SetCastShadows(true);
+		s3d.AddLight(directionLight);
+
+		var directionLight1 = new DirectionLight(255, 255, 255);
+		directionLight1.SetPosition(glm::vec3(50, 50, 50));
+		directionLight1.SetCastShadows(true);
+		s3d.AddLight(directionLight1);
+
+		var directionLight3 = new DirectionLight(255 * 0.33, 255 * 0.33, 255 * 0.33);
+		directionLight3.SetPosition(glm::vec3(0, 50, -50));
+		directionLight3.SetCastShadows(true);
+		s3d.AddLight(directionLight3);
+
+		var skybox = new SkyBox();
+		skybox.SetMaterial(skyboxMaterial);
+		s3d.AddChild(skybox);
+
+		var cude = new Cube();
+		cude.SetMaterial(cubeMaterial);
+		cude.SetPosition(0,0.5,0);
+		s3d.AddChild(cude);
+
+		var cude2 = new Cube();
+		cude2.SetMaterial(cubeMaterial2);
+		cude2.SetPosition(2.5,0.5,0.2);
+		s3d.AddChild(cude2);
+
+		var plane = new Plane();
+		plane.SetMaterial(planeMaterial);
+		plane.Rotate(-90, glm::vec3(1, 0, 0));
+		plane.SetScale(glm::vec3(300.0, 300.0, 1.0));
+		s3d.AddChild(plane);
+	}
+
+	function onCommand(cmdid) { }
+
+	// 键盘操作视口（消息驱动，参照 cacl.cb 的 onMessage 处理）
+	//   按住按键时 Windows 会持续发送 WM_KEYDOWN(自动重复)，实现连续移动
+	function onMessage(message, wParam, lParam)
+	{
+		if (message == WM_KEYDOWN)
+		{
+			var step = 0.1;
+			// 方向码与 Camera.cb 中 CAM_* 常量一致: 0前 1后 2左 3右 4升 5降
+			// 同时驱动 g_view3d 的相机（View3D 内含 camera::Camera，接口一致）
+			var vcam = null;
+			if (g_view3d != null) vcam = g_view3d.GetCamera();
+
+			if (wParam == 'W') { if (vcam != null) vcam.ProcessKeyboard(0, step); }
+			else if (wParam == 'S') { if (vcam != null) vcam.ProcessKeyboard(1, step); }
+			else if (wParam == 'A') { if (vcam != null) vcam.ProcessKeyboard(2, step); }
+			else if (wParam == 'D') { if (vcam != null) vcam.ProcessKeyboard(3, step); }
+			else if (wParam == 'Q') { if (vcam != null) vcam.ProcessKeyboard(4, step); }
+			else if (wParam == 'E') { if (vcam != null) vcam.ProcessKeyboard(5, step); }
+			// 方向键：换视角（改变偏航/俯仰角，等效鼠标移动）
+			//   每个方向键的偏移会乘 MouseSensitivity；按住时自动重复=连续转动
+			else if (wParam == VK_LEFT) { if (vcam != null) vcam.ProcessMouseMovement(0.0 - 5.0, 0.0, true); }  // ← 左看
+			else if (wParam == VK_RIGHT) { if (vcam != null) vcam.ProcessMouseMovement(5.0, 0.0, true); }        // → 右看
+			else if (wParam == VK_UP) { if (vcam != null) vcam.ProcessMouseMovement(0.0, 5.0, true); }        // ↑ 上看
+			else if (wParam == VK_DOWN) { if (vcam != null) vcam.ProcessMouseMovement(0.0, 0.0 - 5.0, true); }  // ↓ 下看
+		}
+		else if (message == WM_SIZE)
+		{
+			// 窗口尺寸变化：重建交换链后台缓冲/深度缓冲/视口，并更新相机投影宽高比
+			var nw = lParam & 0xFFFF;
+			var nh = (lParam >> 16) & 0xFFFF;
+			if (nw > 0 && nh > 0 && (nw != m_LastWndW || nh != m_LastWndH))
+			{
+				m_LastWndW = nw;
+				m_LastWndH = nh;
+				g_d3d.resizeSwapChain(nw, nh);
+				var rc = new DarwRect(0, 0, nw, nh);
+				g_view3d.SetViewRect(rc);
+				g_view3d.WindowReSize();
+			}
+			return true;
+		}
+		return false;
+	}
+
+	function run(params)
+	{
+		show();
+        updateWindow();
+
+        var pMsg = new CLibPointer();
+        pMsg.malloc(tagMSG.size());
+        while(1)
+        {
+			if(PeekMessage(pMsg,null,0,0,PM_REMOVE))
+			{
+				var tempMsg = pMsg.copyAddr();
+				tempMsg.readPointer(true);
+				if (tempMsg.readInt() == WM_QUIT)
+				{
+					break;
+				}	
+				TranslateMessage(pMsg);
+				DispatchMessage(pMsg);
+			}
+			else
+			{
+				var begint = mtime();
+				g_d3d.renderFrame();
+				var endt = mtime();
+				//print "renderFrame cost: " + (endt - begint) + "ms";
+			}
+        }
+        pMsg.free();
+	}
+}
+
+function main()
+{
+	CoInitializeEx(0,0);   // 初始化 COM，WIC 解码贴图需要
+	var win = new D3D11Win();
+	win.run();
+	CoUninitialize();
+}

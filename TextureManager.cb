@@ -1,0 +1,53 @@
+import texture.cb
+
+// =============================================================================
+// TextureManager：模仿 d3dcdemo/TextureManager.h 的写法
+//   C++ 端是单例 map<string, Texture*>，对应 CBrother 用模块级变量持有单例
+//   + Map 容器（key 为 string，value 为 Texture 对象）。
+//   用法:
+//     var tm = GetTextureManager();
+//     tm.AddTexture("container", new Texture("res\\container2.png"));
+//     var tex = tm.GetTexture("container");
+//     tex.Load(); tex.CreateTexture(device); tex.Bind(0, context);
+//   说明: 与 C++ 一致，AddTexture 在 key 已存在时返回 false 且不覆盖；
+//         GetTexture 找不到返回 null。
+// =============================================================================
+
+
+class TextureManager
+{
+    var m_TextureMap = new Map();
+
+    function TextureManager()
+    {
+    }
+
+    // 对应 C++ AddTexture(string key, Texture* t)，key 已存在返回 false 不覆盖
+    function AddTexture(key, t)
+    {
+        if (m_TextureMap.get(key) != null)
+        {
+            return false;
+        }
+        m_TextureMap.set(key, t);
+        return true;
+    }
+
+    // 对应 C++ GetTexture(string key)，找不到返回 null
+    function GetTexture(key)
+    {
+        return m_TextureMap.get(key);
+    }
+
+    // 对应 C++ 没有但实用：按 key 移除（可选）
+    function RemoveTexture(key)
+    {
+        m_TextureMap.remove(key);
+    }
+
+    // 全部清空（可选，对应析构时的资源释放）
+    function Clear()
+    {
+        m_TextureMap.clear();
+    }
+}

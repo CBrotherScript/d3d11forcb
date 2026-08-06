@@ -1,0 +1,199 @@
+// ============================================================================
+// ShaderManager.cb —— 着色器管理器（架构参照 d3dcdemo 的 ShaderManager.h/.cpp）
+//
+// 设计要点（与 C++ 版一致）：
+//   1. 单例：getShaderManager() 返回全局唯一实例（对齐 C++ static get()）。
+//   2. 构造函数里把所有着色器一次性从 GetRoot() + "hlsl/" 编译进 m_ShaderList。
+//   3. 以“类型索引数组”管理多个 Shader：m_ShaderList[ShaderType] = shader。
+//   4. 输入布局的连续内存块（CLibPointer）只在此处拼装一次，复用给所有 Shader，
+//      不再让每个 Shader 各自拼装。
+//
+//   GetShader(type)   按类型取用（越界返回 null）
+//   Release()         清空所有 shader
+// ============================================================================
+
+import Shader.cb
+
+// 各常量缓冲字节大小（对齐 C++ sizeof，并按 16 字节对齐到 16 的倍数）
+const CB_VS_NORMAL  = 80;     // VsNormalBuffer: float4x4(64) + bool(4) -> 80
+const CB_PS_NORMAL  = 48;     // PsNormalBuffer: 40 -> 对齐到 48
+const CB_VS_SKYBOX  = 128;    // VsSkyBoxBuffer: 2x float4x4
+const CB_VS_SKINNED = 12800;  // VsSkinnedBuffer: MAX_BONES(200) * 64
+
+class ShaderManager
+{
+    var m_ShaderList;   // Shader 数组，下标 = ShaderType
+    var m_pStdLayout;   // CLibPointer 连续内存块（标准 5 元素布局）
+    var m_pSkinLayout;  // CLibPointer 连续内存块（蒙皮 7 元素布局）
+    var m_pSkyboxLayout;// CLibPointer 连续内存块（天空盒 1 元素布局：仅 POSITION）
+
+    function ShaderManager()
+    {
+        m_ShaderList = new Array();
+		m_ShaderList.resize(8);
+        _buildLayoutPointers();   // 输入布局只拼装一次
+        _loadAll();
+    }
+
+    // ---------- 构造单个输入元素描述（slot 固定 0，InputSlotClass 固定 per-vertex）----------
+    function _mkElem(name, semanticIndex, format, offset)
+    {
+        var e = new D3D11_INPUT_ELEMENT_DESC();
+        e.SetSemanticName(name);
+        e.SetSemanticIndex(semanticIndex);
+        e.SetFormat(format);
+        e.SetInputSlot(0);
+        e.SetAlignedByteOffset(offset);
+        e.SetInputSlotClass(D3D11_INPUT_PER_VERTEX_DATA);
+        e.SetInstanceDataStepRate(0);
+        return e.m_Data;
+    }
+
+    var m_LayoutArrayInfo = new CLibArray(structInfo_D3D11InputElementDesc,10);
+    // ---------- 标准输入布局（5 元素）：pos / uv / normal / tangent / bitangent ----------
+    function _makeStandardLayout()
+    {
+        var arrayData = new CLibArrayData(m_LayoutArrayInfo);
+        arrayData.setStruct(0,_mkElem("POSITION",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0));
+        arrayData.setStruct(1,_mkElem("TEXCOORDS",  0, DXGI_FORMAT_R32G32_FLOAT,    12));
+        arrayData.setStruct(2,_mkElem("NORMAL",     0, DXGI_FORMAT_R32G32B32_FLOAT, 20));
+        arrayData.setStruct(3,_mkElem("TANGENT",    0, DXGI_FORMAT_R32G32B32_FLOAT, 32));
+        arrayData.setStruct(4,_mkElem("BITANGENT",  0, DXGI_FORMAT_R32G32B32_FLOAT, 44));
+        return arrayData;
+    }
+
+    // ---------- 骨骼动画输入布局（7 元素）：标准 5 + boneIds + weights ----------
+    function _makeSkinnedLayout()
+    {
+        var arrayData = new CLibArrayData(m_LayoutArrayInfo);
+        arrayData.setStruct(0,_mkElem("POSITION",   0, DXGI_FORMAT_R32G32B32_FLOAT, 0));
+        arrayData.setStruct(1,_mkElem("TEXCOORDS",  0, DXGI_FORMAT_R32G32_FLOAT,    12));
+        arrayData.setStruct(2,_mkElem("NORMAL",     0, DXGI_FORMAT_R32G32B32_FLOAT, 20));
+        arrayData.setStruct(3,_mkElem("TANGENT",    0, DXGI_FORMAT_R32G32B32_FLOAT, 32));
+        arrayData.setStruct(4,_mkElem("BITANGENT",  0, DXGI_FORMAT_R32G32B32_FLOAT, 44));
+        arrayData.setStruct(5,_mkElem("BONEIDS",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 56));
+        arrayData.setStruct(6,_mkElem("WEIGHTS",  0, DXGI_FORMAT_R32G32B32A32_FLOAT, 72));
+        return arrayData;
+    }
+
+    // ---------- 天空盒输入布局（1 元素）：仅 POSITION（配合 pos-only 立方体网格）----------
+    function _makeSkyboxLayout()
+    {
+        var arrayData = new CLibArrayData(m_LayoutArrayInfo);
+        arrayData.setStruct(0,_mkElem("POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0));
+        return arrayData;
+    }
+
+    function _buildLayoutPointers()
+    {
+        m_pStdLayout  = _makeStandardLayout();
+        m_pSkinLayout = _makeSkinnedLayout();
+        m_pSkyboxLayout = _makeSkyboxLayout();
+    }
+
+    // ---------- 构造时加载所有着色器，并提前创建各着色器的常量缓冲 ----------
+    function _loadAll()
+    {
+        var root = GetRoot() + "hlsl/";
+		print root;
+
+        // 0 - SHADER_TYPE_2D（无常量缓冲）
+        _add(SHADER_TYPE_2D, new Shader(
+            root + "Basic_2D_VS.hlsl",
+            root + "Basic_2D_PS.hlsl",
+            m_pStdLayout.addr(), 5), SHADER_TYPE_2D);
+
+        // 1 - SHADER_TYPE_3D_NORMAL（CB0=VS, CB1=PS，对应 C++ VsNormalBuffer / PsNormalBuffer）
+        var sNormal = new Shader(
+            root + "Normal3D_VS.hlsl",
+            root + "Normal3D_PS.hlsl",
+            m_pStdLayout.addr(), 5);
+        _add(SHADER_TYPE_3D_NORMAL, sNormal, SHADER_TYPE_3D_NORMAL);
+        sNormal.CreateConstantBuffer(0, CB_VS_NORMAL);
+        sNormal.CreateConstantBuffer(1, CB_PS_NORMAL);
+
+        // 2 - SHADER_TYPE_3D_SKINNED（CB0=VS, CB1=PS, CB2=Skinned）
+        var sSkin = new Shader(
+            root + "Normal3D_Skinned_VS.hlsl",
+            root + "Normal3D_PS.hlsl",
+            m_pSkinLayout.addr(), 7);
+        _add(SHADER_TYPE_3D_SKINNED, sSkin, SHADER_TYPE_3D_SKINNED);
+        sSkin.CreateConstantBuffer(0, CB_VS_NORMAL);
+        sSkin.CreateConstantBuffer(1, CB_PS_NORMAL);
+        sSkin.CreateConstantBuffer(2, CB_VS_SKINNED);
+
+        // 3 - SHADER_TYPE_SKYBOX（CB0=SkyBox）
+        var sSky = new Shader(
+            root + "Skybox_VS.hlsl",
+            root + "Skybox_PS.hlsl",
+            m_pSkyboxLayout.addr(), 1);
+        _add(SHADER_TYPE_SKYBOX, sSky, SHADER_TYPE_SKYBOX);
+        sSky.CreateConstantBuffer(0, CB_VS_SKYBOX);
+
+        // 4 - SHADER_TYPE_DEPTH（无像素着色器，fragmentPath 传 null；CB0=VS, CB1=PS）
+        var sDepth = new Shader(
+            root + "Normal3D_VS.hlsl",
+            null,
+            m_pStdLayout.addr(), 5);
+        _add(SHADER_TYPE_DEPTH, sDepth, SHADER_TYPE_DEPTH);
+        sDepth.CreateConstantBuffer(0, CB_VS_NORMAL);
+        sDepth.CreateConstantBuffer(1, CB_PS_NORMAL);
+
+        // 5 - SHADER_TYPE_DEPTH_SKINNED（CB0=VS, CB1=PS, CB2=Skinned）
+        var sDepthSkin = new Shader(
+            root + "Normal3D_Skinned_VS.hlsl",
+            root + "Normal3DDepth_PS.hlsl",
+            m_pSkinLayout.addr(), 7);
+        _add(SHADER_TYPE_DEPTH_SKINNED, sDepthSkin, SHADER_TYPE_DEPTH_SKINNED);
+        sDepthSkin.CreateConstantBuffer(0, CB_VS_NORMAL);
+        sDepthSkin.CreateConstantBuffer(1, CB_PS_NORMAL);
+        sDepthSkin.CreateConstantBuffer(2, CB_VS_SKINNED);
+
+        // 6 - SHADER_TYPE_GBUFFER（CB0=VS, CB1=PS）
+        var sGBuffer = new Shader(
+            root + "Normal3D_VS.hlsl",
+            root + "GBuffer.hlsl",
+            m_pStdLayout.addr(), 5);
+        _add(SHADER_TYPE_GBUFFER, sGBuffer, SHADER_TYPE_GBUFFER);
+        sGBuffer.CreateConstantBuffer(0, CB_VS_NORMAL);
+        sGBuffer.CreateConstantBuffer(1, CB_PS_NORMAL);
+
+        // 7 - SHADER_TYPE_DEFERRED（Basic_2D_VS + DeferredShading，CB0=VS, CB1=PS）
+        // 延迟光照合成：全屏 quad 采样 4 张 GBuffer SRV，逐像素计算光照
+        var sDeferred = new Shader(
+            root + "Basic_2D_VS.hlsl",
+            root + "DeferredShading.hlsl",
+            m_pStdLayout.addr(), 5);
+        _add(SHADER_TYPE_DEFERRED, sDeferred, SHADER_TYPE_DEFERRED);
+        sDeferred.CreateConstantBuffer(0, CB_VS_SKYBOX);
+        sDeferred.CreateConstantBuffer(1, CB_PS_NORMAL);
+    }
+
+    // 注册一个 shader：按下标 = type 存入；SetType 后存入数组
+    function _add(type, shader, t)
+    {
+        if (shader == null) return;
+        shader.m_Type = t;
+        m_ShaderList[type] = shader;
+        //print "addshader " + type + " " + shader;
+    }
+
+    // 按类型获取 shader（对齐 C++ GetShader(ShaderType)）
+    function GetShader(type)
+    {
+        //print "getshader " + type + " " + m_ShaderList.size();
+        if (type >= 0 && type < m_ShaderList.size())
+        {
+            var s = m_ShaderList[type];
+            if (s == null) return null;
+            return s;
+        }
+        return null;
+    }
+
+    // 释放所有 shader（析构 / 重置时调用）
+    function Release()
+    {
+        m_ShaderList = new Array();
+    }
+}

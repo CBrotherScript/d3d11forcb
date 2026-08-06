@@ -1,0 +1,29 @@
+
+// =============================================================================
+// 应用入口：窗口 + 渲染循环
+// =============================================================================
+var g_d3d = new D3DDevice();
+var g_d3ddevice = null;
+var g_d3dcontext = null;
+var g_textureManager = null;
+var g_view3d = null;
+var g_shaderManager = null;
+var g_materialManager = null;
+var g_render3DCatch = null;
+var g_lightManager = null;
+
+// 阴影深度图尺寸
+const LIGHT_DEPTH_MAP_SIZE = 1024;
+const LIGHT_MAX_POINT     = 4;
+const LIGHT_MAX_DIRECTION = 4;
+const MAX_OFFSCREEN_BUFFER_COUNT = 4;
+
+// 延迟渲染
+const DEFERED_SHADING_ENABLE = false;
+
+// ---- 绘制类型----
+const DRAW_TYPE_NORMAL = 0;
+const DRAW_TYPE_PICK   = 1;
+const DRAW_TYPE_DEPTH  = 2;   // 阴影/深度 pass
+const DRAW_TYPE_SKYBOX = 3;   // 天空盒 pass
+const DRAW_TYPE_GBUFFER = 4;  // 延迟渲染 GBuffer pass（几何写入多渲染目标）

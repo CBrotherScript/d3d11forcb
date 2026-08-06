@@ -1,0 +1,34 @@
+// Scene.cb — CBrother 版 Scene 基类
+// 对应 d3dcdemo/Scene.h
+//
+// 说明：C++ 中 Scene 是所有 3D 场景的基类（持有 Sprite 列表，Darw 时遍历绘制）。
+// 这里直接实现完整逻辑（非灯光、非 FBO，无需预留）。
+
+class Scene
+{
+    // ===== 成员（对应 C++ protected: vector<Sprite*> m_Sprite）=====
+    var m_Sprite = [];   // Sprite3D / 任何带 Darw(v, t) 的对象
+
+    // ===== 构造 / 析构 =====
+    function Scene() {}
+
+    // ===== 场景图接口 =====
+    // 对应 C++ Scene::AddChild(Sprite* s)
+    function AddChild(s)
+    {
+        if (s == null) return;
+        m_Sprite.add(s);
+    }
+
+    // ===== 绘制 =====
+    // 对应 C++ Scene::Darw(View* v, DRAW_TYPE t)：遍历子节点调用其 Darw
+    // virtual：允许 Scene3D 等子类多态覆盖
+    virtual function Darw(v, t)
+    {
+        for (var i = 0; i < m_Sprite.size(); i++)
+        {
+            if (m_Sprite[i] != null)
+                m_Sprite[i].Darw(v, t);
+        }
+    }
+}

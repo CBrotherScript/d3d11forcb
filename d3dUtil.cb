@@ -1,0 +1,54 @@
+// d3dUtil.cb
+//
+//   - .cso 预编译缓存的读取与回写
+//   - 编译标志（D3DCOMPILE_*）的组合（含 Debug 开关）
+
+import lib/windows/d3d11
+
+// 是否开启 Debug 编译（对应 C++ 的 #ifdef _DEBUG）
+// 开启后会附加 D3DCOMPILE_DEBUG 与 D3DCOMPILE_SKIP_OPTIMIZATION
+var D3DUTIL_DEBUG = false;
+
+//   csoFileName : 预编译 .cso 缓存路径，可为 null/"" 表示不读写缓存
+//   hlslFileName: .hlsl 源文件路径（UTF-8）
+//   entryPoint  : 入口函数名，如 "VS" / "PS"
+//   shaderModel : 着色器模型，如 "vs_5_0" / "ps_5_0"
+// 返回 D3DCompileResult（HResult / CodeBlob / ErrorBlob），与 D3DCompile 保持一致
+function CreateShaderFromFile(csoFileName, hlslFileName, entryPoint, shaderModel)
+{
+	// 1. 若指定了 .cso，先尝试读取已编译好的二进制（命中缓存则直接返回）
+	if (csoFileName != null && csoFileName != "")
+	{
+		var cached = D3DReadFileToBlob(csoFileName);
+		if (cached != null)
+			return new D3DCompileResult(0, cached, null);
+	}
+
+	// 2. 编译 HLSL
+	var dwShaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
+	if (D3DUTIL_DEBUG)
+	{
+		dwShaderFlags = dwShaderFlags | D3DCOMPILE_DEBUG;
+		dwShaderFlags = dwShaderFlags | D3DCOMPILE_SKIP_OPTIMIZATION;
+	}
+
+	var res = D3DCompileFromFile(hlslFileName, entryPoint, shaderModel, dwShaderFlags);
+
+	// 3. 编译失败时打印错误信息（对应 C++ OutputDebugStringA）
+	if (res.HResult != 0)
+	{
+		if (res.ErrorBlob != null)
+		{
+			var eba = res.ErrorBlob.GetBufferPointer().readBytes(res.ErrorBlob.GetBufferSize());
+			print "Shader 编译错误 (" + hlslFileName + "):\n" + eba.readString();
+			res.ErrorBlob.Release();   // SAFE_RELEASE(errorBlob)
+		}
+		return new D3DCompileResult(res.HResult, null, null);
+	}
+
+	// 4. 若指定了 .cso，将编译结果写回缓存文件
+	if (csoFileName != null && csoFileName != "")
+		D3DWriteBlobToFile(csoFileName, res.CodeBlob, 1);   // TRUE 覆盖
+
+	return res;
+}

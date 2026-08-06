@@ -1,0 +1,171 @@
+// mesh.cb — CBrother 版 Mesh 类 (对应 d3dcdemo/Mesh.h + Mesh.cpp)
+// 管理顶点属性数组，调用 Finalize() 交错顶点数据并创建 D3D11 缓冲
+
+import d3ddevice
+
+class Mesh
+{
+    // ---------- 顶点属性数组（原始，未交错） ----------
+    var m_Positions = [];      // float[]  (每顶点3分量)
+    var m_UVs = [];            // float[]  (每顶点2分量)
+    var m_Normals = [];        // float[]  (每顶点3分量)
+    var m_Tangents = [];       // float[]  (每顶点3分量)
+    var m_Bitangents = [];     // float[]  (每顶点3分量)
+    var m_Colors = [];         // float[]  (每顶点4分量)
+    var m_BoneIds = [];        // int[]    (每顶点4分量)
+    var m_Weights = [];        // float[]  (每顶点4分量)
+
+    // ---------- 各属性分量计数 ----------
+    //   position=3, uv=2, normal=3, tangent=3, bitangent=3, color=4, bone=8(4int+4float)
+    var m_PositionsCnt = 0;
+    var m_UVCnt         = 0;
+    var m_NormalCnt     = 0;
+    var m_TangentCnt    = 0;
+    var m_BitangentCnt  = 0;
+    var m_ColorCnt      = 0;
+    var m_BoneCnt       = 0;
+
+    // ---------- 索引 ----------
+    var m_Indices = [];     // int[]
+    var m_IndicesCnt = 0;
+
+    // ---------- D3D11 缓冲 ----------
+    var m_pVertexBuffer = null;    // ID3D11Buffer* (指针 int)
+    var m_pIndexBuffer  = null;    // ID3D11Buffer* (指针 int)
+
+    var m_Stride = new D3D11_INT_ARRAY(1);
+    var m_Offset = new D3D11_INT_ARRAY(1);
+
+    function Mesh()
+    {
+    }
+
+    // -----------------------------------------------
+    // Finalize — 交错顶点属性并创建 D3D11 缓冲
+    // 调用前确保 m_Positions / m_Indices 等已填好
+    // -----------------------------------------------
+    function Finalize()
+    {
+        var vcnt = m_PositionsCnt / 3;
+        if (vcnt <= 0) { trace("Mesh.Finalize: no vertices"); return; }
+
+        // 计算每顶点浮点数
+        var fpv = 3;                   // position always present
+        if (m_UVCnt        > 0) { fpv = fpv + 2; }
+        if (m_NormalCnt    > 0) { fpv = fpv + 3; }
+        if (m_TangentCnt   > 0) { fpv = fpv + 3; }
+        if (m_BitangentCnt > 0) { fpv = fpv + 3; }
+        if (m_BoneCnt      > 0) { fpv = fpv + 8; }
+
+        var totalBytes = vcnt * fpv * 4;  // sizeof(float) == 4
+        var pVData = new CLibPointer();
+        pVData.malloc(totalBytes);
+        var off = 0;
+        for (var i = 0; i < vcnt; i++)
+        {
+            // position (3f)
+            pVData.setFloat(off,     m_Positions[i * 3]);
+            pVData.setFloat(off + 4, m_Positions[i * 3 + 1]);
+            pVData.setFloat(off + 8, m_Positions[i * 3 + 2]);
+            off = off + 12;
+
+            // uv (2f)
+            if (m_UVCnt > 0)
+            {
+                pVData.setFloat(off,     m_UVs[i * 2]);
+                pVData.setFloat(off + 4, m_UVs[i * 2 + 1]);
+                off = off + 8;
+            }
+
+            // normal (3f)
+            if (m_NormalCnt > 0)
+            {
+                pVData.setFloat(off,     m_Normals[i * 3]);
+                pVData.setFloat(off + 4, m_Normals[i * 3 + 1]);
+                pVData.setFloat(off + 8, m_Normals[i * 3 + 2]);
+                off = off + 12;
+            }
+
+            // tangent (3f)
+            if (m_TangentCnt > 0)
+            {
+                pVData.setFloat(off,     m_Tangents[i * 3]);
+                pVData.setFloat(off + 4, m_Tangents[i * 3 + 1]);
+                pVData.setFloat(off + 8, m_Tangents[i * 3 + 2]);
+                off = off + 12;
+            }
+
+            // bitangent (3f)
+            if (m_BitangentCnt > 0)
+            {
+                pVData.setFloat(off,     m_Bitangents[i * 3]);
+                pVData.setFloat(off + 4, m_Bitangents[i * 3 + 1]);
+                pVData.setFloat(off + 8, m_Bitangents[i * 3 + 2]);
+                off = off + 12;
+            }
+
+            // bone (4 int + 4 float)
+            if (m_BoneCnt > 0)
+            {
+                pVData.setInt(off,      m_BoneIds[i * 4]);
+                pVData.setInt(off + 4,  m_BoneIds[i * 4 + 1]);
+                pVData.setInt(off + 8,  m_BoneIds[i * 4 + 2]);
+                pVData.setInt(off + 12, m_BoneIds[i * 4 + 3]);
+                off = off + 16;
+
+                pVData.setFloat(off,     m_Weights[i * 4]);
+                pVData.setFloat(off + 4, m_Weights[i * 4 + 1]);
+                pVData.setFloat(off + 8, m_Weights[i * 4 + 2]);
+                pVData.setFloat(off + 12, m_Weights[i * 4 + 3]);
+                off = off + 16;
+            }
+        }
+
+        // ---------- 顶点缓冲 ----------
+        var pVBD = new D3D11_BUFFER_DESC(totalBytes, D3D11_BIND_VERTEX_BUFFER);
+        pVBD.SetUsage(D3D11_USAGE_IMMUTABLE);
+        var sdVB = new D3D11_SUBRESOURCE_DATA();
+        sdVB.SetSysMem(pVData);
+        sdVB.SetSysMemPitch(0);
+        sdVB.SetSysMemSlicePitch(0);
+
+        m_pVertexBuffer = g_d3ddevice.CreateBuffer(pVBD, sdVB);
+        if (m_pVertexBuffer == null)
+        {
+            print "Mesh.Finalize: CreateVertexBuffer failed";
+            return;
+        }
+
+        var stride = fpv * 4;  // stride in bytes
+
+        // ---------- 索引缓冲 ----------
+        if (m_IndicesCnt > 0)
+        {
+            var idxBytes = m_IndicesCnt * 4;
+            var pIdx = new CLibPointer();
+            pIdx.malloc(idxBytes);
+            for (var j = 0; j < m_IndicesCnt; j++)
+            {
+                pIdx.setInt(j * 4, m_Indices[j]);
+            }
+
+            var pIBD = new D3D11_BUFFER_DESC(idxBytes, D3D11_BIND_INDEX_BUFFER);
+            pIBD.SetUsage(D3D11_USAGE_IMMUTABLE);
+            var sdIB = new D3D11_SUBRESOURCE_DATA();
+            sdIB.SetSysMem(pIdx);
+            sdIB.SetSysMemPitch(0);
+            sdIB.SetSysMemSlicePitch(0);
+
+            m_pIndexBuffer = g_d3ddevice.CreateBuffer(pIBD, sdIB);
+            if (m_pIndexBuffer == null)
+            {
+                trace("Mesh.Finalize: CreateIndexBuffer failed");
+                return;
+            }
+        }
+
+        m_Stride.Set(0, stride);
+        m_Offset.Set(0, 0);
+        print "Mesh.Finalize: ok  v=" + vcnt + " i=" + m_IndicesCnt + " stride=" + stride;
+    }
+}

@@ -1,0 +1,156 @@
+import CBCLib.code
+import lib/math
+import lib/glm
+
+// ============================================================================
+// Camera.cb — 摄像机类（CBrother / CB 语言版本）
+//
+//   * 用欧拉角 (Yaw/Pitch) 计算 Front / Right / Up 向量与视图矩阵。
+//   * 输入抽象为 ProcessKeyboard / ProcessMouseMovement / ProcessMouseScroll，
+//     与具体窗口/输入系统解耦。
+//   * 额外提供键盘轮询 ProcessInput()，基于 Win32 GetAsyncKeyState：
+//        W / S    前后 (FORWARD / BACKWARD)
+//        A / D    左右 (LEFT / RIGHT)
+//        E / Q    升降 (UP / DOWN)
+//
+// 使用：
+//   import camera;
+//   var cam = new camera::Camera(glm::vec3(0.0, 0.0, 6.0));  // 看向原点
+//   camera::ProcessInput(cam, dt);          // 每帧轮询键盘
+//   var view = cam.GetViewMatrix();         // 喂 MVP
+// ============================================================================
+
+// 摄像机移动方向
+const CAM_FORWARD  = 0;
+const CAM_BACKWARD = 1;
+const CAM_LEFT     = 2;
+const CAM_RIGHT    = 3;
+const CAM_UP       = 4;
+const CAM_DOWN     = 5;
+
+const CAM_YAW         = -90.0;
+const CAM_PITCH       = 0.0;
+const CAM_SPEED       = 2.5;
+const CAM_SENSITIVITY = 0.1;
+const CAM_ZOOM        = 45.0;
+
+// 摄像机类：用欧拉角计算 Front/Up/Right 与视图矩阵
+class Camera
+{
+	var Position;        // Vec3 摄像机位置
+	var Front;           // Vec3 前方向（单位向量）
+	var Up;              // Vec3 上方向
+	var Right;           // Vec3 右方向
+	var WorldUp;         // Vec3 世界上向量
+	var Yaw;             // float 偏航角（度）
+	var Pitch;           // float 俯仰角（度）
+	var MovementSpeed;   // float 移动速度
+	var MouseSensitivity;// float 鼠标灵敏度
+	var Zoom;            // float 视野（FOV，度）
+	var m_ViewDirty = false;
+	var m_ViewMatrix;
+
+	// 构造：位置 / 世界上向量 / 偏航 / 俯仰（均可省略，用默认值）
+	function Camera(position, up, yaw, pitch)
+	{
+		if (position == null) position = glm::vec3(0.0, 0.0, 0.0);
+		if (up == null)       up = glm::vec3(0.0, 1.0, 0.0);
+		if (yaw == null)      yaw = CAM_YAW;
+		if (pitch == null)    pitch = CAM_PITCH;
+
+		Position = position;
+		WorldUp  = up;
+		Yaw      = yaw;
+		Pitch    = pitch;
+		MovementSpeed   = CAM_SPEED;
+		MouseSensitivity = CAM_SENSITIVITY;
+		Zoom     = CAM_ZOOM;
+		Front    = glm::vec3(0.0, 0.0, -1.0);
+		updateCameraVectors();
+		m_ViewDirty = true;
+	}
+
+	// 返回视图矩阵：lookAt(Position, Position + Front, Up)
+	function GetViewMatrix()
+	{
+		if (m_ViewDirty)
+		{
+			m_ViewMatrix = glm::lookAt(Position, glm::add(Position, Front), Up);
+			m_ViewDirty = false;
+		}
+		return m_ViewMatrix.copy();		
+	}
+
+	// 键盘移动：direction 取 CAM_* 常量，dt 为帧间隔（秒）
+	function ProcessKeyboard(direction, dt)
+	{
+		var velocity = MovementSpeed * dt;
+		if (direction == CAM_FORWARD)
+			Position = glm::add(Position, glm::scaleVec(Front, velocity));
+		else if (direction == CAM_BACKWARD)
+			Position = glm::sub(Position, glm::scaleVec(Front, velocity));
+		else if (direction == CAM_LEFT)
+			Position = glm::sub(Position, glm::scaleVec(Right, velocity));
+		else if (direction == CAM_RIGHT)
+			Position = glm::add(Position, glm::scaleVec(Right, velocity));
+		else if (direction == CAM_UP)
+			Position = glm::add(Position, glm::scaleVec(WorldUp, velocity));
+		else if (direction == CAM_DOWN)
+			Position = glm::sub(Position, glm::scaleVec(WorldUp, velocity));
+		m_ViewDirty = true;
+	}
+
+	// 鼠标移动：xoffset / yoffset 为偏移量（此处会乘灵敏度）
+	function ProcessMouseMovement(xoffset, yoffset, constrainPitch)
+	{
+		if (constrainPitch == null) constrainPitch = true;
+		Yaw   = Yaw   + xoffset * MouseSensitivity;
+		Pitch = Pitch + yoffset * MouseSensitivity;
+		// 限制俯仰，避免翻转
+		if (constrainPitch)
+		{
+			if (Pitch > 89.0) Pitch = 89.0;
+			if (Pitch < -89.0) Pitch = -89.0;
+		}
+		updateCameraVectors();
+		m_ViewDirty = true;   // Yaw/Pitch 变化，视图需重算
+	}
+
+	// 滚轮：调整视野（FOV），范围 1° ~ 45°
+	function ProcessMouseScroll(yoffset)
+	{
+		Zoom = Zoom - yoffset;
+		if (Zoom < 1.0) Zoom = 1.0;
+		if (Zoom > 45.0) Zoom = 45.0;
+	}
+
+	// 由欧拉角重算 Front / Right / Up
+	function updateCameraVectors()
+	{
+		var fx = math::cos(glm::radians(Yaw)) * math::cos(glm::radians(Pitch));
+		var fy = math::sin(glm::radians(Pitch));
+		var fz = math::sin(glm::radians(Yaw)) * math::cos(glm::radians(Pitch));
+		Front = glm::normalize(glm::vec3(fx, fy, fz));
+		Right = glm::normalize(glm::cross(Front, WorldUp));
+		Up    = glm::normalize(glm::cross(Right, Front));
+	}
+}
+
+// 返回某虚拟键是否按下（高位 0x8000 表示按下）
+function KeyDown(vk)
+{
+	var state = GetAsyncKeyState(vk);
+	return (state & 0x8000) != 0;
+}
+
+// 每帧轮询键盘并驱动摄像机（W/S/A/D 前后左右，E/Q 升降），dt 为帧间隔（秒）
+function ProcessInput(cam, dt)
+{
+	if (KeyDown('W')) cam.ProcessKeyboard(CAM_FORWARD, dt);   // W
+	if (KeyDown('S')) cam.ProcessKeyboard(CAM_BACKWARD, dt);  // S
+	if (KeyDown('A')) cam.ProcessKeyboard(CAM_LEFT, dt);      // A
+	if (KeyDown('D')) cam.ProcessKeyboard(CAM_RIGHT, dt);     // D
+	if (KeyDown('E')) cam.ProcessKeyboard(CAM_UP, dt);        // E
+	if (KeyDown('Q')) cam.ProcessKeyboard(CAM_DOWN, dt);      // Q
+}
+

@@ -1,0 +1,55 @@
+// ============================================================================
+// MaterialManager.cb —— 材质管理器（严格对齐 d3dcdemo 的 MaterialManager.h/.cpp）
+//
+//   C++ 版结构：
+//     static MaterialManager* get();              -> getMaterialManager()
+//     MaterialManager();                          -> 构造时 m_Material[MATERIAL_NORMAL] = new NormalMaterial()
+//     Material* CreateNormalMaterial();           -> 返回 m_Material[MATERIAL_NORMAL]->Copy()
+//     Material* CreateSkinnedMaterial();          -> Copy NORMAL 后换蒙皮 shader
+//     friend class Sprite3D;
+//     Material* m_Material[MaterialType::MATERIAL_MAX];  -> 下标按 MaterialType
+//
+//   CBrother 版逐一对齐，只保留 C++ 有的两个工厂方法，不额外加 GBuffer/Depth 等。
+// ============================================================================
+
+import Material.cb
+import ShaderManager.cb
+
+// 单例实例（对齐 C++ static 局部变量）
+var _gMaterialManager = null;
+
+class MaterialManager
+{
+    var m_Material;   // Material 数组，下标 = MaterialType
+
+    function MaterialManager()
+    {
+        m_Material = new Array();
+        m_Material.resize(4);
+        // 构造时初始化普通材质（对齐 C++: m_Material[MATERIAL_NORMAL] = new NormalMaterial()）
+        m_Material[MATERIAL_NORMAL] = new NormalMaterial();
+    }
+
+    // 返回普通材质的副本（对齐 C++: m_Material[MATERIAL_NORMAL]->Copy()）
+    function CreateNormalMaterial()
+    {
+        return m_Material[MATERIAL_NORMAL].Copy();
+    }
+
+    // 复制普通材质，再把 shader 换成蒙皮版本（对齐 C++ CreateSkinnedMaterial）
+    function CreateSkinnedMaterial()
+    {
+        var material = m_Material[MATERIAL_NORMAL].Copy();
+        material.m_Shader        = getShaderManager().GetShader(SHADER_TYPE_3D_SKINNED);
+        material.m_DepthMapShader = getShaderManager().GetShader(SHADER_TYPE_DEPTH_SKINNED);
+        return material;
+    }
+}
+
+// 单例访问（对齐 C++ static MaterialManager* get()）
+function getMaterialManager()
+{
+    if (_gMaterialManager == null)
+        _gMaterialManager = new MaterialManager();
+    return _gMaterialManager;
+}

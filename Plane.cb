@@ -1,0 +1,57 @@
+// plane.cb — CBrother 版 Plane 几何体
+// 对应 d3dcdemo/Plane.h + Plane.cpp
+// 只描述自身顶点信息（4 顶点正方形面，位于 XY 平面 Z=0，范围 [-0.5, 0.5]），不含变换/渲染逻辑
+
+import mesh.cb
+import sprite3d
+
+class Plane extends Sprite3D 
+{
+
+    function Plane()
+    {
+        super();
+        m_Mesh = new Mesh();
+
+        // ---- position (4 × 3 = 12 float) ----
+        m_Mesh.m_PositionsCnt = 12;
+        m_Mesh.m_Positions = [
+            -0.5, -0.5, 0,    // BL
+             0.5, -0.5, 0,    // BR
+             0.5,  0.5, 0,    // TR
+            -0.5,  0.5, 0     // TL
+        ];
+
+        // ---- UV (4 × 2 = 8 float) ----
+        m_Mesh.m_UVCnt = 8;
+        m_Mesh.m_UVs = [
+            0, 0,   1, 0,   1, 1,   0, 1
+        ];
+
+        // ---- Normal (12 float) 全部指向 +Z ----
+        m_Mesh.m_NormalCnt = 12;
+        m_Mesh.m_Normals = [
+            0, 0, 1,   0, 0, 1,   0, 0, 1,   0, 0, 1
+        ];
+
+        // ---- Tangent (12 float) ----
+        m_Mesh.m_TangentCnt = 12;
+        m_Mesh.m_Tangents = [
+            0, 0, -1,   0, 0, -1,   0, 0, -1,   0, 0, -1
+        ];
+
+        // ---- Bitangent (12 float) ----
+        m_Mesh.m_BitangentCnt = 12;
+        m_Mesh.m_Bitangents = [
+            0, 0, -1,   0, 0, -1,   0, 0, -1,   0, 0, -1
+        ];
+
+        // ---- Indices (6 int)：2 三角形 ----
+        m_Mesh.m_IndicesCnt = 6;
+        m_Mesh.m_Indices = [0, 1, 2, 2, 3, 0];
+
+        m_Mesh.Finalize();
+    }
+
+    function getMesh() { return m_Mesh; }
+}

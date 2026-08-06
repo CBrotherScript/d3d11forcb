@@ -1,0 +1,474 @@
+import d3ddevice.cb
+import camera.cb
+import texture.cb
+import define.cb
+
+// =============================================================================
+// view3d.cb — 仿 d3dcdemo/View3D.h + View.h 的 CBrother 版本
+//
+// 说明:
+//   * C++ 中 View3D : public View。CBrother 没有类继承的静态绑定语义，这里把
+//     基类 View 也一并在本文件实现（DarwRect / View / View3D），把架构搭起来。
+//   * C++ 用 D3DDevice 的静态成员 (m_d3dDevice / m_d3dDeviceCtx / m_renderTargetView
+//     / m_depthStencilView)。CBrother 版本用全局单例:
+//        g_d3ddevice        -> ID3D11Device   (define.cb)
+//        g_d3d.m_Context     -> ID3D11DeviceContext
+//        g_d3d.m_Rtv / m_Dsv  -> 主渲染目标/深度视图
+//   * 部分接口（GBuffer 多渲染目标 MRT、PickItem 拾取）依赖当前 d3d11.cb 尚未
+//     封装的能力（多 RTV OMSetRenderTargets、矩阵求逆等），先留空占位，
+//     架构与函数签名先补齐，后续可逐步实现。
+// =============================================================================
+
+
+// =============================================================================
+// DarwRect：视口矩形（对应 C++ DarwStruct.h 的 DarwRect）
+// =============================================================================
+class DarwRect
+{
+	var bx = 0;
+	var by = 0;
+	var width = 0;
+	var height = 0;
+
+	function DarwRect(x, y, w, h)
+	{
+		if (x != null) bx = x;
+		if (y != null) by = y;
+		if (w != null) width = w;
+		if (h != null) height = h;
+	}
+
+	// 点是否落在矩形内（对应 C++ DarwRect::IsIn）
+	function IsIn(x, y)
+	{
+		return x >= bx && x < bx + width && y >= by && y < by + height;
+	}
+}
+
+
+// =============================================================================
+// View：视图基类（对应 d3dcdemo/View.h）
+// =============================================================================
+class View
+{
+	var m_DrawWindow = null;
+	var m_Rect       = null;
+	var m_AspectRatio = 1.0;
+	var m_Scene      = null;
+
+	function View(win, rect)
+	{
+		m_DrawWindow = win;
+		m_Rect = rect;
+		if (rect != null && rect.height != 0)
+			m_AspectRatio = rect.width * 1.0 / rect.height;
+	}
+
+	function SetViewRect(rect)
+	{
+		m_Rect = rect;
+		if (rect != null && rect.height != 0)
+			m_AspectRatio = rect.width * 1.0 / rect.height;
+	}
+
+	function WindowReSize() {}
+
+	function SetScene(scene) { m_Scene = scene; }
+
+	function Darw()
+	{		
+		if (m_Scene != null)
+			m_Scene.Darw(this, DRAW_TYPE_NORMAL);
+	}
+
+	function OnMouseMove(x, y) { return; }
+}
+
+
+// =============================================================================
+// View3D：3D 视图（对应 d3dcdemo/View3D.h）
+// =============================================================================
+class View3D
+{
+	// ---- 继承自 View 的成员（CBrother 无继承，直接内联）----
+	var m_Rect        = null;
+	var m_AspectRatio = 1.0;
+	var m_Scene       = null;
+
+	// ---- View3D 自身成员 ----
+	var m_Camera      = null;
+
+	var m_HdrWidht    = 0;
+	var m_HdrHeight   = 0;
+
+	// 离屏缓冲（每项是一个 idx -> 视图/纹理 的数组，长度 MAX_OFFSCREEN_BUFFER_COUNT）
+	var m_OffscreenColorTexture       = [];  // ID3D11Texture2D
+	var m_OffscreenColorBuffer        = [];  // RTV 指针
+	var m_OffscreenColorResourceView  = [];  // SRV 指针
+	var m_OffscreenDepthTexture       = [];  // ID3D11Texture2D
+	var m_OffscreenDepthBuffer        = [];  // DSV 指针
+
+	// ---- GBuffer ----
+	var m_GPositionRTV = null;
+	var m_GPositionSRV = null;
+	var m_GNormalRTV   = null;
+	var m_GNormalSRV   = null;
+	var m_GColorRTV    = null;
+	var m_GColorSRV    = null;
+	var m_GSpecularRTV = null;
+	var m_GSpecularSRV = null;
+
+	var m_GBufferRTVs  = null;   // 长度 4 的数组
+
+	// 4 个 GBuffer RTV 的"pointer"类型数组（对应 C++ 的 ID3D11RenderTargetView* m_GBufferRTVs[4]）
+	// 用 CLibArray("pointer",4) 分配，元素宽度随平台字长（32/64 位）自动适配，避免手动 8 字节写入在 32 位下越界。
+	var m_GBufferRTVArr = null;
+	// 4 个 GBuffer SRV 的"pointer"类型数组（对应 C++ 的 ID3D11ShaderResourceView* m_GBufferSRVs[4]），供延迟合成 PSSetShaderResources 使用
+	var m_GBufferSRVArr = null;
+
+	var m_GBuffer      = 0;
+	var m_GPosition    = 0;
+	var m_GNormal      = 0;
+	var m_GColor       = 0;
+	var m_GSpecular    = 0;
+	var m_GRboDepth    = 0;
+
+	// 构造（对应 View3D::View3D）
+	function View3D(rect)
+	{
+		m_Rect = rect;
+		if (rect != null && rect.height != 0)
+			m_AspectRatio = rect.width * 1.0 / rect.height;
+
+		m_Camera = new Camera(glm::vec3(0.0, 0.0, 6.0), null, null, null);
+
+		m_HdrWidht = 0;
+		m_HdrHeight = 0;
+
+		m_GBuffer   = 0;
+		m_GPosition = 0;
+		m_GNormal   = 0;
+		m_GColor    = 0;
+		m_GSpecular = 0;
+		m_GRboDepth = 0;
+
+        m_OffscreenColorTexture.resize(MAX_OFFSCREEN_BUFFER_COUNT);
+		m_OffscreenColorBuffer.resize(MAX_OFFSCREEN_BUFFER_COUNT);
+		m_OffscreenColorResourceView.resize(MAX_OFFSCREEN_BUFFER_COUNT);
+		m_OffscreenDepthTexture.resize(MAX_OFFSCREEN_BUFFER_COUNT);
+		m_OffscreenDepthBuffer.resize(MAX_OFFSCREEN_BUFFER_COUNT);
+		m_GBufferRTVs = [null, null, null, null];
+	}
+
+	// ---- 基类 View 接口 ----
+	function SetScene(scene) { m_Scene = scene; }
+	function OnMouseMove(x, y) { return; }
+	function WindowReSize()
+	{
+		// 离屏缓冲尺寸跟随窗口：先 Release 持有的 COM 引用（CBrother 不会因赋值 null 自动释放），
+		// 再置空，使下次绑定时按新尺寸重建。不 Release 会导致纹理/视图引用计数泄漏。
+		for (var i = 0; i < MAX_OFFSCREEN_BUFFER_COUNT; i++)
+		{
+			if (m_OffscreenColorTexture[i] != null)      { m_OffscreenColorTexture[i].Release();      m_OffscreenColorTexture[i] = null; }
+			if (m_OffscreenColorResourceView[i] != null) { m_OffscreenColorResourceView[i].Release(); m_OffscreenColorResourceView[i] = null; }
+			if (m_OffscreenColorBuffer[i] != null)       { m_OffscreenColorBuffer[i].Release();       m_OffscreenColorBuffer[i] = null; }
+			if (m_OffscreenDepthTexture[i] != null)      { m_OffscreenDepthTexture[i].Release();      m_OffscreenDepthTexture[i] = null; }
+			if (m_OffscreenDepthBuffer[i] != null)       { m_OffscreenDepthBuffer[i].Release();       m_OffscreenDepthBuffer[i] = null; }
+		}
+
+		// GBuffer 同理：窗口尺寸变化后必须按新 m_Rect 重建，否则延迟合成时
+		// GBuffer 仍是旧尺寸纹理，而视口已是新尺寸 → 画面拉伸/错位。
+		// 先 Release 各自持有的引用，再置空，使下次 BindGBuffer 触发 CreateGBuffer 重建。
+		if (m_GPositionRTV != null) { m_GPositionRTV.Release(); m_GPositionRTV = null; }
+		if (m_GPositionSRV != null) { m_GPositionSRV.Release(); m_GPositionSRV = null; }
+		if (m_GNormalRTV   != null) { m_GNormalRTV.Release();   m_GNormalRTV   = null; }
+		if (m_GNormalSRV   != null) { m_GNormalSRV.Release();   m_GNormalSRV   = null; }
+		if (m_GColorRTV    != null) { m_GColorRTV.Release();    m_GColorRTV    = null; }
+		if (m_GColorSRV    != null) { m_GColorSRV.Release();    m_GColorSRV    = null; }
+		if (m_GSpecularRTV != null) { m_GSpecularRTV.Release(); m_GSpecularRTV = null; }
+		if (m_GSpecularSRV != null) { m_GSpecularSRV.Release(); m_GSpecularSRV = null; }
+		m_GBufferRTVs  = [null, null, null, null];
+		m_GBufferRTVArr = null;   // CLibArrayData 包装的是裸指针，Release 视图后无需再 Release 数组本身
+		m_GBufferSRVArr = null;
+	}
+
+	function GetCamera() { return m_Camera; }
+
+	// 对应 View3D::SetCameraPostion
+	function SetCameraPostion(v, front)
+	{
+		if (front == null) front = glm::vec3(0.0, 0.0, -1.0);
+		m_Camera.Position = v;
+		m_Camera.Front = front;
+	}
+
+	// 对应 View3D::SetViewRect
+	function SetViewRect(rect)
+	{
+		m_Rect = rect;
+		if (rect != null && rect.height != 0)
+			m_AspectRatio = rect.width * 1.0 / rect.height;
+
+		if (m_Rect.width == m_HdrWidht && m_Rect.height == m_HdrHeight)
+			return;
+
+		m_HdrWidht  = m_Rect.width;
+		m_HdrHeight = m_Rect.height;
+	}
+
+	// 对应 View3D::Darw -> View::Darw
+	function Darw()
+	{
+		//print "vvvvvvvvvv--------------------------";
+		if (m_Scene != null)
+			m_Scene.Darw(this, DRAW_TYPE_NORMAL);
+			//print "vvvvvvvvvv--------------------------end";
+	}
+
+	// 对应 View3D::PickItem —— 依赖矩阵求逆/射线拾取，暂留空占位
+	function PickItem(x, y)
+	{
+		// TODO: 需要 glm::inverse 与 Scene3D.Pick 支持，先返回 null
+		return null;
+	}
+
+	// 对应 View3D::getViewPos —— 屏幕坐标反投影到世界坐标，暂留空占位
+	function getViewPos(x, y, pro, view)
+	{
+		// TODO: 依赖 glm::inverse(mat4) 与 vec4 运算，后续实现
+		return glm::vec3(0.0, 0.0, 0.0);
+	}
+
+	// =========================================================================
+	// 离屏缓冲（对应 View3D::CreateOffscreenBuffer）
+	// =========================================================================
+	function CreateOffscreenBuffer()
+	{
+		var device = g_d3ddevice;
+		if (device == null) { print "CreateOffscreenBuffer: device is null"; return; }
+
+		for (var i = 0; i < MAX_OFFSCREEN_BUFFER_COUNT; i++)
+		{
+			// 释放旧资源
+			if (m_OffscreenColorTexture[i] != null)
+			{
+				m_OffscreenColorTexture[i]      = null;
+				m_OffscreenColorBuffer[i]       = null;
+				m_OffscreenDepthTexture[i]      = null;
+				m_OffscreenDepthBuffer[i]       = null;
+			}
+
+			// --- 颜色纹理 (RGBA8, 可作 RT + SRV) ---
+			var tdesc = new D3D11_TEXTURE2D_DESC();
+			tdesc.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+			tdesc.SetUsage(D3D11_USAGE_DEFAULT);
+			tdesc.SetArraySize(1);
+			tdesc.SetMipLevels(1);
+			tdesc.SetSampleCount(1);
+			tdesc.SetSampleQuality(0);
+			tdesc.SetHeight(m_Rect.height);
+			tdesc.SetWidth(m_Rect.width);
+			tdesc.SetBindFlags(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+			tdesc.SetCPUAccessFlags(0);
+			tdesc.SetMiscFlags(0);
+
+			var colorTex = device.CreateTexture2D(tdesc, null);
+			if (colorTex == null) { print "CreateOffscreenBuffer: color tex failed"; continue; }
+			m_OffscreenColorTexture[i] = colorTex;
+
+			// SRV
+			var srvDesc = new D3D11_SHADER_RESOURCE_VIEW_DESC();
+			srvDesc.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+			srvDesc.SetViewDimension(D3D11_SRV_DIMENSION_TEXTURE2D);
+			srvDesc.SetMostDetailedMip(0);
+			srvDesc.SetMipLevels(1);
+			m_OffscreenColorResourceView[i] = device.CreateShaderResourceView(colorTex, srvDesc);
+
+			// RTV
+			m_OffscreenColorBuffer[i] = device.CreateRenderTargetView(colorTex, null);
+
+			// --- 深度纹理 (R24G8, 可作 DS + SRV) ---
+			var ddesc = new D3D11_TEXTURE2D_DESC();
+			ddesc.SetFormat(DXGI_FORMAT_R24G8_TYPELESS);
+			ddesc.SetUsage(D3D11_USAGE_DEFAULT);
+			ddesc.SetArraySize(1);
+			ddesc.SetMipLevels(1);
+			ddesc.SetSampleCount(1);
+			ddesc.SetSampleQuality(0);
+			ddesc.SetHeight(m_Rect.height);
+			ddesc.SetWidth(m_Rect.width);
+			ddesc.SetBindFlags(D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE);
+			ddesc.SetCPUAccessFlags(0);
+			ddesc.SetMiscFlags(0);
+
+			var depthTex = device.CreateTexture2D(ddesc, null);
+			if (depthTex == null) { print "CreateOffscreenBuffer: depth tex failed"; continue; }
+			m_OffscreenDepthTexture[i] = depthTex;
+
+			// DSV：TYPELESS 纹理无法推断格式，显式指定 D24S8（与 C++ 一致）
+			var dsvDesc = new D3D11_DEPTH_STENCIL_VIEW_DESC();
+			dsvDesc.SetFormat(DXGI_FORMAT_D24_UNORM_S8_UINT);
+			dsvDesc.SetViewDimension(D3D11_DSV_DIMENSION_TEXTURE2D);
+			dsvDesc.SetFlags(0);
+			dsvDesc.SetMipSlice(0);
+			m_OffscreenDepthBuffer[i] = device.CreateDepthStencilView(depthTex, dsvDesc);
+		}
+	}
+
+	var m_ClearColor = new D3D11_Float4(0.0, 0.0, 0.0, 0.0);
+	// 对应 View3D::BindOffscreenBuffer
+	function BindOffscreenBuffer(idx)
+	{
+		if (idx < 0 || idx >= MAX_OFFSCREEN_BUFFER_COUNT) return;
+
+		if (m_OffscreenColorTexture[idx] == null)
+			CreateOffscreenBuffer();
+
+		var ctx = g_d3d.m_Context;
+		if (ctx == null) return;
+
+		ctx.OMSetRenderTargets(1,m_OffscreenColorBuffer[idx].GetAddressOf(), m_OffscreenDepthBuffer[idx]);
+		ctx.ClearRenderTargetView(m_OffscreenColorBuffer[idx], m_ClearColor);
+		ctx.ClearDepthStencilView(m_OffscreenDepthBuffer[idx],
+			D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0, 0);
+
+		var vp = new D3D11_VIEWPORT();
+		vp.SetTopLeftX(m_Rect.bx * 1.0);
+		vp.SetTopLeftY(m_Rect.by * 1.0);
+		vp.SetWidth(m_Rect.width * 1.0);
+		vp.SetHeight(m_Rect.height * 1.0);
+		vp.SetMinDepth(0.0);
+		vp.SetMaxDepth(1.0);
+		ctx.RSSetViewports(vp);
+	}
+
+	// 对应 View3D::UnbindOffscreenBuffer —— 恢复到主渲染目标
+	function UnbindOffscreenBuffer(idx)
+	{
+		var ctx = g_d3d.m_Context;
+		if (ctx == null) return;
+		ctx.OMSetRenderTargets(1,g_d3d.m_Rtv.GetAddressOf(), g_d3d.m_Dsv);
+	}
+
+	// =========================================================================
+	// GBuffer（对应 View3D::CreateGBuffer）
+	// =========================================================================
+	function CreateGBuffer()
+	{
+		var device = g_d3ddevice;
+		if (device == null) { print "CreateGBuffer: device is null"; return; }
+
+		// Position / Normal 用 RGBA16F，Color / Specular 用 RGBA8
+		var tdesc = new D3D11_TEXTURE2D_DESC();
+		tdesc.SetFormat(DXGI_FORMAT_R16G16B16A16_FLOAT);
+		tdesc.SetUsage(D3D11_USAGE_DEFAULT);
+		tdesc.SetArraySize(1);
+		tdesc.SetMipLevels(1);
+		tdesc.SetSampleCount(1);
+		tdesc.SetSampleQuality(0);
+		tdesc.SetHeight(m_Rect.height);
+		tdesc.SetWidth(m_Rect.width);
+		tdesc.SetBindFlags(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+		tdesc.SetCPUAccessFlags(0);
+		tdesc.SetMiscFlags(0);
+
+		var srvDesc = new D3D11_SHADER_RESOURCE_VIEW_DESC();
+		srvDesc.SetFormat(DXGI_FORMAT_R16G16B16A16_FLOAT);
+		srvDesc.SetViewDimension(D3D11_SRV_DIMENSION_TEXTURE2D);
+		srvDesc.SetMostDetailedMip(0);
+		srvDesc.SetMipLevels(1);
+
+		// Position
+		var tex = device.CreateTexture2D(tdesc, null);
+		if (tex != null)
+		{
+			m_GPositionSRV = device.CreateShaderResourceView(tex, srvDesc);
+			m_GPositionRTV = device.CreateRenderTargetView(tex, null);
+			tex.Release();
+		}
+
+		// Normal
+		tex = device.CreateTexture2D(tdesc, null);
+		if (tex != null)
+		{
+			m_GNormalSRV = device.CreateShaderResourceView(tex, srvDesc);
+			m_GNormalRTV = device.CreateRenderTargetView(tex, null);
+			tex.Release();
+		}
+
+		// Color (RGBA8)
+		tdesc.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+		srvDesc.SetFormat(DXGI_FORMAT_R8G8B8A8_UNORM);
+		tex = device.CreateTexture2D(tdesc, null);
+		if (tex != null)
+		{
+			m_GColorSRV = device.CreateShaderResourceView(tex, srvDesc);
+			m_GColorRTV = device.CreateRenderTargetView(tex, null);
+			tex.Release();
+		}
+
+		// Specular (RGBA8)
+		tex = device.CreateTexture2D(tdesc, null);
+		if (tex != null)
+		{
+			m_GSpecularSRV = device.CreateShaderResourceView(tex, srvDesc);
+			m_GSpecularRTV = device.CreateRenderTargetView(tex, null);
+			tex.Release();
+		}
+
+		m_GBufferRTVs[0] = m_GPositionRTV;
+		m_GBufferRTVs[1] = m_GNormalRTV;
+		m_GBufferRTVs[2] = m_GColorRTV;
+		m_GBufferRTVs[3] = m_GSpecularRTV;
+
+		// 构造 pointer 类型数组（"pointer" 元素宽度随平台字长自动适配），供 OMSetRenderTargets 的 ppRenderTargetViews 使用
+		m_GBufferRTVArr = new CLibArrayData(new CLibArray("pointer", 4));
+		m_GBufferRTVArr.setPointer(0, m_GPositionRTV.Get());
+		m_GBufferRTVArr.setPointer(1, m_GNormalRTV.Get());
+		m_GBufferRTVArr.setPointer(2, m_GColorRTV.Get());
+		m_GBufferRTVArr.setPointer(3, m_GSpecularRTV.Get());
+
+		// 同样的 pointer 类型数组，供延迟合成 PSSetShaderResources 的 ppShaderResourceViews 使用
+		m_GBufferSRVArr = new CLibArrayData(new CLibArray("pointer", 4));
+		m_GBufferSRVArr.setPointer(0, m_GPositionSRV.Get());
+		m_GBufferSRVArr.setPointer(1, m_GNormalSRV.Get());
+		m_GBufferSRVArr.setPointer(2, m_GColorSRV.Get());
+		m_GBufferSRVArr.setPointer(3, m_GSpecularSRV.Get());
+	}
+
+	// 对应 View3D::BindGBuffer
+	function BindGBuffer()
+	{
+		if (m_GPositionRTV == null)
+			CreateGBuffer();
+
+		var ctx = g_d3d.m_Context;
+		if (ctx == null) return;
+
+		// 对应 C++ View3D::BindGBuffer：OMSetRenderTargets(4, m_GBufferRTVs, m_GBufferDepthStencil)
+		// 4 个 RTV 指针已预装入 m_GBufferRTVArr（pointer 类型数组，CLibArray("pointer",4)），直接传入 MRT
+		ctx.OMSetRenderTargets(4, m_GBufferRTVArr.addr(), g_d3d.m_Dsv);
+		for (var i = 0; i < 4; i++)
+		{
+			if (m_GBufferRTVs[i] != null)
+				ctx.ClearRenderTargetView(m_GBufferRTVs[i], m_ClearColor);
+		}
+
+		var vp = new D3D11_VIEWPORT();
+		vp.SetTopLeftX(m_Rect.bx * 1.0);
+		vp.SetTopLeftY(m_Rect.by * 1.0);
+		vp.SetWidth(m_Rect.width * 1.0);
+		vp.SetHeight(m_Rect.height * 1.0);
+		vp.SetMinDepth(0.0);
+		vp.SetMaxDepth(1.0);
+		ctx.RSSetViewports(vp);
+	}
+
+	// 对应 View3D::UnbindGBuffer —— 恢复到主渲染目标
+	function UnbindGBuffer()
+	{
+		var ctx = g_d3d.m_Context;
+		if (ctx == null) return;
+		ctx.OMSetRenderTargets(1,g_d3d.m_Rtv.GetAddressOf(), g_d3d.m_Dsv);
+	}
+}
