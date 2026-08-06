@@ -134,7 +134,7 @@ class Sprite3D
     {
         if (child == null) return;
         child.m_Parent = this;
-        m_Children.append(child);
+        m_Children.add(child);
     }
     function SetVisable(v) { m_Visable = v; }
 
